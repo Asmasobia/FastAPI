@@ -1,0 +1,428 @@
+# ==============================================================================
+# 20-postgres.yaml — PostgreSQL as a StatefulSet + headless Service.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ READ THIS FIRST: running your own database in Kubernetes is a LEARNING   │
+# │ EXERCISE here, not a production recommendation.                          │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# In production you would almost certainly use a managed database — RDS, Cloud
+# SQL, Azure Database — or, if it must live in the cluster, a purpose-built
+# OPERATOR (CloudNativePG, Zalando's postgres-operator, Crunchy PGO). Reason:
+# Kubernetes gives you restart, rescheduling, and storage attachment. It does NOT
+# give you point-in-time recovery, automated failover with correct fencing,
+# connection pooling, major-version upgrades, or backup verification. Those are
+# the hard parts of running a database, and a StatefulSet solves none of them.
+#
+# Saying that out loud is the difference between "I ran Postgres in Kubernetes"
+# and "I understand what running Postgres in Kubernetes does and doesn't buy."
+# The second answer is the one that lands in an interview.
+#
+# We do it by hand here because building it teaches you StatefulSets, PVCs,
+# headless Services, and stable network identity — which you need regardless.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# PART 1 — the Service (declared FIRST in the file, deliberately)
+# ------------------------------------------------------------------------------
+# WHY THE SERVICE COMES BEFORE THE STATEFULSET:
+#   A StatefulSet's `serviceName` field must point at a Service that governs its
+#   network identity. Kubernetes doesn't enforce the Service exists first — it
+#   will create the StatefulSet and the DNS records simply won't resolve until
+#   the Service appears. Declaring it first in the same file (`---` separated)
+#   means one apply, correct order, no race.
+#
+# WHY HEADLESS (clusterIP: None):
+#   A normal ClusterIP Service gives you ONE virtual IP that load-balances across
+#   all matching Pods. That is exactly wrong for a database with replicas: you
+#   would randomly write to a read-only replica.
+#
+#   A headless Service allocates no virtual IP. Instead, CoreDNS returns the Pod
+#   IPs directly, AND — because this is a StatefulSet's governing Service —
+#   creates one stable per-Pod DNS name:
+#
+#       postgres-0.postgres.tasks-api.svc.cluster.local
+#       <pod>    .<svc>   .<namespace>.svc.cluster.local
+#
+#   That per-Pod name is the whole point of a StatefulSet. It survives restart
+#   and rescheduling even though the Pod IP changes, which is what lets replicas
+#   find a specific primary by name.
+#
+# THE DECISION WE MADE HERE — one Service doing two jobs:
+#   The app connects to `postgres:5432`, and the StatefulSet uses the same
+#   Service as its `serviceName`. With ONE replica this works fine: the headless
+#   Service's A record returns the single Pod's IP, so `postgres` resolves and
+#   the client connects.
+#
+#   Cost of that shortcut: it does not generalise. Add a read replica and
+#   `postgres` starts round-robining between primary and replica, which breaks
+#   writes intermittently — the worst failure mode, because it works most of the
+#   time. The correct shape at that point is TWO Services: a headless one for
+#   identity (`postgres-headless`) and a normal ClusterIP one selecting only the
+#   primary (usually via a label a controller maintains, e.g. `role: primary`).
+#
+#   REVISIT IF: you add a second Postgres replica. Not before — two Services for
+#   one Pod is ceremony without benefit, and unexplained ceremony reads as
+#   cargo-culting.
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: tasks-api
+  labels:
+    app: postgres
+spec:
+  # No virtual IP. See the reasoning above.
+  clusterIP: None
+
+  # WHAT A SELECTOR ACTUALLY DOES:
+  #   The Service does not know about the StatefulSet. It matches PODS by label.
+  #   That indirection is Kubernetes' core loose-coupling mechanism — you could
+  #   delete the StatefulSet and hand-create a Pod with `app: postgres` and this
+  #   Service would happily route to it.
+  #
+  #   The failure mode is silence: a selector that matches nothing produces a
+  #   Service with ZERO endpoints and no error anywhere. Connections just hang or
+  #   get refused. Module 04 has you introduce this typo on purpose so you learn
+  #   to reach for `kubectl get endpoints` first.
+  selector:
+    app: postgres
+
+  ports:
+    - name: postgres          # Naming ports is required once you have >1, and is
+                              # good habit regardless — NetworkPolicies and some
+                              # tooling can reference ports by name.
+      port: 5432              # The port on the Service.
+      targetPort: 5432        # The port on the Pod. Same here; they often differ.
+      protocol: TCP
+
+---
+# ------------------------------------------------------------------------------
+# PART 2 — the StatefulSet
+# ------------------------------------------------------------------------------
+# STATEFULSET vs DEPLOYMENT — the decision, stated properly:
+#
+#   Deployment                          StatefulSet
+#   ─────────────────────────────────   ─────────────────────────────────────
+#   Pods are interchangeable            Pods have identities (postgres-0, -1)
+#   Random name suffixes                Ordinal names, stable across restarts
+#   No stable per-Pod DNS               Stable per-Pod DNS via headless Service
+#   All Pods share a PVC, or none       Each Pod gets its OWN PVC, reattached
+#                                       to the same ordinal after rescheduling
+#   Parallel create/update              Ordered create (0,1,2) and delete (2,1,0)
+#
+#   The deciding question is NOT "does it have data?" — it's "does each replica
+#   need its own durable identity and its own volume?" A database does: replica 1
+#   must reattach to replica 1's disk, never replica 2's. That single requirement
+#   is what a Deployment cannot express.
+#
+#   Contrast with 21-redis.yaml, which IS a Deployment despite Redis being a data
+#   store — because there we use it as a disposable cache with no persistence, so
+#   no identity is needed. The workload's ROLE decides, not the software category.
+#   That distinction is the interesting part of this file.
+# ------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: tasks-api
+  labels:
+    app: postgres
+
+spec:
+  # Ties this StatefulSet to the headless Service above, which is what creates
+  # the stable per-Pod DNS names. Omit it and you lose the main reason to have
+  # chosen a StatefulSet.
+  serviceName: postgres
+
+  # ONE replica, deliberately. Postgres does not do multi-primary; adding a
+  # second replica without streaming replication and a failover controller gives
+  # you two independent databases with the same name, which is a data-loss
+  # generator rather than high availability.
+  #
+  # Consequence to state honestly: this is a SINGLE POINT OF FAILURE. Rescheduling
+  # the Pod means downtime. That's the correct trade for a learning cluster, and
+  # the reason production uses an operator or a managed service.
+  replicas: 1
+
+  # ⚠️ IMMUTABLE AFTER CREATION. If you need to change which labels select the
+  # Pods, you must delete and recreate the StatefulSet. This is why selectors
+  # should use a small, stable label set — never `version` or anything that
+  # changes per release.
+  selector:
+    matchLabels:
+      app: postgres
+
+  # ---- The Pod template ----------------------------------------------------
+  # Everything under `template` describes the Pods to create. Changing anything
+  # in here triggers a rollout; changing fields OUTSIDE it (like `replicas`)
+  # does not.
+  template:
+    metadata:
+      labels:
+        # MUST match spec.selector.matchLabels above, or the API server rejects
+        # the object outright. A StatefulSet that couldn't select its own Pods
+        # would be unable to count them.
+        app: postgres
+    spec:
+      # ---- Security context (Pod-level) ----------------------------------
+      # WHY THIS BLOCK LOOKS DIFFERENT FROM THE APP'S DEPLOYMENT:
+      #   40-deployment.yaml sets runAsNonRoot: true. This does NOT, and that is
+      #   deliberate rather than an oversight — worth being able to explain,
+      #   because "always run non-root" is the rule everyone recites.
+      #
+      #   The official postgres image's entrypoint starts as root so it can
+      #   chown/chmod the data directory (Postgres refuses to start on a data
+      #   directory with loose permissions), THEN drops to the `postgres` user
+      #   via gosu before exec'ing the server. So the long-running database
+      #   process is unprivileged; only the few milliseconds of setup are root.
+      #
+      #   Forcing runAsNonRoot: true here makes the container fail at startup
+      #   with a permissions error on PGDATA. You can make a fully rootless
+      #   Postgres work — it needs an initContainer to fix ownership, or an image
+      #   built for it (Bitnami's, or CloudNativePG) — but that's complexity
+      #   without much gain in a single-node learning cluster.
+      #
+      #   THE TRANSFERABLE POINT: security defaults are defaults, not laws. Know
+      #   which ones you're deviating from and why. An unexplained deviation is a
+      #   red flag; an explained one is engineering judgement.
+      securityContext:
+        # fsGroup makes the kubelet chown the mounted volume to this GID before
+        # the container starts. 999 is the `postgres` group in the official
+        # Debian-based image.
+        #
+        # WHY IT'S NEEDED: a freshly-provisioned volume is owned by root. Without
+        # fsGroup, the postgres user cannot write to it. This is the single most
+        # common "my stateful workload won't start" cause, and the error message
+        # ("could not create directory", "Permission denied") doesn't point at
+        # the volume.
+        fsGroup: 999
+
+      containers:
+        - name: postgres
+
+          # PIN THE MINOR-VERSION FAMILY, NOT `latest`.
+          #   `postgres:latest` means a `kubectl rollout restart` six months from
+          #   now can silently pull a new MAJOR version, whose data directory
+          #   format is incompatible — the Pod then crash-loops with "database
+          #   files are incompatible with server" and you have an outage caused
+          #   by a tag, not a deploy.
+          #   `postgres:16` still tracks patch releases (16.1 -> 16.2), which is
+          #   what you want for security fixes. Pin to `16.4` if you need full
+          #   reproducibility, or a digest (@sha256:...) if you need it absolute.
+          image: postgres:16
+
+          # IfNotPresent: use the local image if it's already cached, otherwise
+          # pull. For a tag like `16` that genuinely exists on Docker Hub this is
+          # fine. (40-deployment.yaml explains why this setting is CRITICAL for
+          # locally-built images.)
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              # NOTE: containerPort is essentially DOCUMENTATION. It does not
+              # open a firewall or publish anything — the Pod's network namespace
+              # already exposes every listening port to the cluster network.
+              # Declaring it matters because Services can reference ports by
+              # name, and because readers (and you, in six months) need to know
+              # what the container listens on.
+
+          # ---- Environment ---------------------------------------------------
+          env:
+            # Superuser name and database name, created on first initialisation.
+            # These match the DATABASE_URL in the Secret:
+            #   postgresql+asyncpg://tasks:<pass>@postgres:5432/tasks
+            #                        ^^^^^                        ^^^^^
+            #                        POSTGRES_USER                POSTGRES_DB
+            #
+            # Not secret, so they're inline rather than in the Secret. Inline
+            # (rather than in the ConfigMap) because they are meaningful only to
+            # this one container — the app never reads them.
+            - name: POSTGRES_USER
+              value: tasks
+            - name: POSTGRES_DB
+              value: tasks
+
+            # The password comes from the Secret. THIS is the pattern to
+            # internalise for any single sensitive value:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tasks-api-secrets
+                  key: POSTGRES_PASSWORD
+                  # ⚠️ If this Secret or key is missing, the Pod does NOT crash
+                  # with a clear message — it sits in `CreateContainerConfigError`
+                  # and never starts. `kubectl get pods` shows the status;
+                  # `kubectl describe pod` shows the actual reason. Get in the
+                  # habit of describe-before-guess.
+                  #
+                  # You can add `optional: true` to tolerate a missing key, which
+                  # is almost never what you want for a credential — a database
+                  # silently starting without the password you intended is worse
+                  # than not starting.
+
+            # ---- PGDATA: a subdirectory, and this matters -------------------
+            # The default data directory is /var/lib/postgresql/data. We mount
+            # our volume at that path and then point PGDATA one level DEEPER.
+            #
+            # WHY: many volume provisioners create artefacts at the mount root —
+            # classically `lost+found` on ext4 filesystems. Postgres' initdb
+            # refuses to initialise a data directory that isn't empty, so you get
+            # "directory exists but is not empty" and the Pod crash-loops on a
+            # freshly-provisioned volume with no obvious cause.
+            #
+            # Using a subdirectory sidesteps it entirely. This is one of those
+            # one-line fixes that costs an afternoon to discover, and it applies
+            # to any database image with the same check.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          volumeMounts:
+            - name: postgres-data        # must match a volumeClaimTemplate name
+              mountPath: /var/lib/postgresql/data
+
+          # ---- Probes --------------------------------------------------------
+          # Full treatment is in Module 07; the essentials for a database:
+          #
+          # `pg_isready` is the right check because it asks the POSTGRES PROTOCOL
+          # whether the server will accept connections. A TCP check (tcpSocket)
+          # would succeed as soon as the port is bound, which happens BEFORE
+          # Postgres finishes recovery — so a TCP-only readiness probe declares
+          # the database ready while it is still refusing queries, and the app
+          # fails its first connections.
+          #
+          # THE GENERAL LESSON: probe the layer your CLIENTS use, not the lowest
+          # layer that happens to respond. "The port is open" is not "the service
+          # works".
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "tasks", "-d", "tasks"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            # READINESS controls Service membership only. Failing it removes this
+            # Pod's IP from the Service endpoints so no new traffic arrives; the
+            # container is NOT restarted. Exactly right for "temporarily busy".
+
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "tasks", "-d", "tasks"]
+            # Deliberately LAZIER than readiness: longer period, higher failure
+            # threshold. Liveness KILLS the container, and killing a database
+            # under heavy load — precisely when it's slow to answer — turns a
+            # slowdown into an outage and can leave recovery work to do on
+            # restart. A liveness probe should only fire for genuine deadlock,
+            # never for slowness.
+            #
+            # 30s x 5 failures = ~2.5 minutes of sustained unresponsiveness
+            # before a restart. That patience is the point.
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+
+          # ---- Resources -----------------------------------------------------
+          # Full treatment in Module 08. Two facts that explain these numbers:
+          #
+          #   REQUESTS are what the SCHEDULER reserves. They decide placement and
+          #     nothing else at runtime.
+          #   LIMITS are enforced at runtime, and the two resources behave
+          #     completely differently:
+          #       CPU is COMPRESSIBLE    -> exceeding the limit means THROTTLING
+          #                                 (slow, still alive)
+          #       Memory is INCOMPRESSIBLE -> exceeding the limit means OOMKilled
+          #                                 (dead, exit code 137)
+          #
+          # WHY POSTGRES GETS A GENEROUS MEMORY LIMIT AND A MODEST REQUEST:
+          #   Postgres uses memory for shared_buffers and per-connection work_mem.
+          #   Getting OOMKilled mid-transaction is far more disruptive than being
+          #   throttled, so we leave headroom. Idle usage is genuinely small,
+          #   hence the low request — over-requesting wastes cluster capacity that
+          #   the scheduler can never hand to anyone else.
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"          # 100 millicores = 0.1 of one core
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+  # ---- volumeClaimTemplates: the StatefulSet's defining feature -------------
+  # This is what a Deployment cannot do. For each replica, the StatefulSet
+  # controller creates its own PersistentVolumeClaim, named:
+  #
+  #     <template-name>-<statefulset-name>-<ordinal>
+  #     postgres-data-postgres-0
+  #
+  # That claim is bound to that ordinal FOREVER. Delete the Pod, reschedule it to
+  # another node, and postgres-0 reattaches to postgres-data-postgres-0. Identity
+  # plus durable storage is the entire value proposition.
+  #
+  # ⚠️ THE MOST IMPORTANT OPERATIONAL FACT ON THIS PAGE:
+  #   Deleting the StatefulSet DOES NOT delete these PVCs. That's intentional —
+  #   it protects you from destroying data with one careless command. It also
+  #   means:
+  #     • Storage keeps costing money after you think you cleaned up.
+  #     • Recreating the StatefulSet REUSES the old volume, so a "fresh start"
+  #       isn't fresh — including the old superuser password, because
+  #       POSTGRES_PASSWORD only applies to an EMPTY data directory. This is the
+  #       single most confusing behaviour for newcomers: you changed the
+  #       password, reapplied everything, and authentication still fails with the
+  #       old one.
+  #
+  #   To genuinely start over:
+  #       kubectl delete statefulset postgres -n tasks-api
+  #       kubectl delete pvc postgres-data-postgres-0 -n tasks-api
+  #
+  #   (Kubernetes 1.27+ has `persistentVolumeClaimRetentionPolicy` to automate
+  #   this. Left off here precisely because the manual step forces you to
+  #   understand the lifecycle.)
+  #
+  # ⚠️ ALSO IMMUTABLE: you cannot edit volumeClaimTemplates after creation — not
+  # even to grow the size. Growing storage means editing the PVC directly (if the
+  # StorageClass has allowVolumeExpansion) and is a genuinely awkward operation.
+  # Think about size before you create, not after.
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          # ReadWriteOnce = mountable read-write by ONE NODE at a time.
+          #
+          # A precise point worth having right, because it's a classic interview
+          # trap: RWO is per-NODE, not per-POD. Multiple Pods on the SAME node can
+          # share an RWO volume. (RWOP — ReadWriteOncePod — is the newer mode that
+          # actually means one Pod.)
+          #
+          # RWO is what essentially all block storage supports: local disks, EBS,
+          # GCE PD, Azure Disk. ReadWriteMany needs a network filesystem (NFS,
+          # EFS, CephFS) and is both slower and wrong for a database — two
+          # Postgres processes on one data directory corrupt it.
+          - ReadWriteOnce
+
+        # No storageClassName set, so the cluster's DEFAULT StorageClass is used.
+        # On k3s / Rancher Desktop that's `local-path`, which provisions a
+        # directory on the node's own disk.
+        #
+        # ⚠️ WHAT local-path MEANS, because it will bite you the moment you use a
+        # second node: the volume is a folder on ONE SPECIFIC NODE. The Pod is
+        # therefore permanently pinned to that node. If the node dies, the data is
+        # gone — there is no replication and no snapshot. On a single-node cluster
+        # that's irrelevant; on a multi-node cluster it silently defeats the
+        # rescheduling you thought you were getting.
+        #
+        # Being explicit about `storageClassName: local-path` would be more
+        # readable but LESS portable — this manifest then fails on a cloud cluster
+        # that has no such class. Relying on the default keeps it portable, at the
+        # cost of the default being invisible. Check yours with:
+        #     kubectl get storageclass
+        # ...and look for the (default) marker.
+        resources:
+          requests:
+            storage: 2Gi
+            # Small on purpose. This is a learning database. Note the asymmetry:
+            # growing later is awkward (see above) but shrinking is IMPOSSIBLE, so
+            # when you're unsure, err slightly large rather than slightly small.

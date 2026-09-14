@@ -1,0 +1,405 @@
+# ==============================================================================
+# 30-migration-job.yaml — run Alembic database migrations exactly once.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ THIS FILE FIXES A REAL BUG. It is the clearest example in the whole      │
+# │ project of Kubernetes forcing you to confront something that "worked"    │
+# │ only because you had exactly one instance.                               │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# WHAT docker-compose.yml DOES TODAY:
+#     command: sh -c "alembic upgrade head && uvicorn src.main:app ..."
+#
+# One container, so migrations run once, then the server starts. Correct, simple,
+# and it has worked every single time — which is exactly why the bug is invisible.
+#
+# WHY THAT BREAKS THE MOMENT YOU HAVE replicas: 3:
+#   All three Pods start at the same time. All three run `alembic upgrade head`
+#   against the same database CONCURRENTLY. What happens next:
+#
+#     • Alembic takes no cross-process lock by default. Three processes read the
+#       current revision, all see the same starting point, and all decide the same
+#       migrations need applying.
+#     • Two of them then fail on DDL — "relation already exists", or a deadlock
+#       on the alembic_version row, or a duplicate index.
+#     • Those Pods exit non-zero, so Kubernetes restarts them, so they try again.
+#       You get a CrashLoopBackOff that eventually resolves itself once one Pod
+#       wins, which makes it look transient rather than structural.
+#     • Worst case, in a migration with several steps, you get a PARTIALLY applied
+#       schema with a version row that claims otherwise. That one is a genuinely
+#       bad afternoon.
+#
+#   And note the shape of the bug: it is not a Kubernetes problem. It was always
+#   wrong — coupling "one-time schema change" to "every process start" is a
+#   design error. Running one replica just hid it. That's the real lesson, and
+#   it's the one worth taking to every future project:
+#
+#       HORIZONTAL SCALING DOESN'T CREATE BUGS. IT REVEALS THE ONES YOU HAD.
+#
+#   Anything that must happen ONCE cannot live in a startup path that runs N
+#   times. Migrations, seed data, cache warming, "create the admin user if
+#   missing", cron-like scheduled jobs, one-off backfills — all the same shape.
+#   Each needs either a Job, a leader election, or genuine idempotency.
+#
+# WHY A JOB IS THE RIGHT ANSWER HERE:
+#   A Job runs a Pod to COMPLETION, once, and records success. That maps exactly
+#   onto "apply the schema, then stop". The alternatives and why they lose:
+#
+#   ── initContainer in the Deployment ──────────────────────────────────────
+#     Runs before the app container in EVERY Pod, so with 3 replicas you get 3
+#     concurrent migrations. Identical bug, just relocated. This is the most
+#     commonly proposed wrong answer, and being able to explain why it's wrong is
+#     a good signal that you actually understand the problem.
+#
+#   ── Helm pre-upgrade hook ────────────────────────────────────────────────
+#     The genuinely correct production answer: Helm runs the hook Job and WAITS
+#     for it before touching the Deployment, so ordering is guaranteed rather
+#     than hoped for. We're not using Helm yet. When you add it, this Job becomes
+#     a hook with two annotations and nothing else changes.
+#
+#   ── ArgoCD sync wave ─────────────────────────────────────────────────────
+#     The GitOps equivalent: annotate this with a lower wave number and ArgoCD
+#     completes it before applying the Deployment. Same guarantee.
+#
+#   ── Run it manually before deploying ─────────────────────────────────────
+#     Works, and is honestly fine for a small team. Loses when you have CI/CD,
+#     because "someone remembered" is not a deployment step.
+# ==============================================================================
+
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  # ⚠️ A FIXED NAME HAS A REAL CONSEQUENCE — READ THIS BEFORE YOUR SECOND DEPLOY.
+  #
+  # A Job's `spec.template` is essentially IMMUTABLE. Once this Job exists, an
+  # apply with a different image tag fails with something like:
+  #
+  #     The Job "tasks-api-migrate" is invalid: spec.template: Invalid value:
+  #     ... field is immutable
+  #
+  # This surprises everybody once. Kubernetes' reasoning is sound: a Job records
+  # "this exact thing ran and succeeded". Mutating it would make that record a
+  # lie. But it means a fixed-name Job cannot be re-run by re-applying.
+  #
+  # THREE WAYS TO HANDLE IT — pick consciously:
+  #
+  #   1. Delete and recreate (what we do here; see k8s/README.md):
+  #        kubectl delete job tasks-api-migrate -n tasks-api --ignore-not-found
+  #        kubectl apply -f k8s/30-migration-job.yaml
+  #      Explicit and obvious. Fine for a small project, tedious in CI.
+  #
+  #   2. `generateName: tasks-api-migrate-` instead of `name:`
+  #      Every apply creates a NEW Job with a random suffix, so there's never a
+  #      conflict. Cost: `kubectl apply` is no longer idempotent — running it
+  #      twice runs the migration twice — and old Jobs pile up unless
+  #      ttlSecondsAfterFinished cleans them. Also `kubectl apply -f` on a
+  #      generateName object behaves like `create`, which surprises people.
+  #
+  #   3. Include the version in the name: `tasks-api-migrate-0-1-0`.
+  #      This is what Helm effectively does. Each release gets its own Job, and
+  #      re-applying the same version is a genuine no-op — which is the property
+  #      you actually want. Best option once a template engine is generating your
+  #      manifests; awkward to maintain by hand.
+  name: tasks-api-migrate
+  namespace: tasks-api
+  labels:
+    app: tasks-api
+    component: migration        # Lets you exclude migration Pods from queries
+                                # that mean "the API", e.g.
+                                #   kubectl logs -l app=tasks-api,component=api
+
+spec:
+  # ---- backoffLimit: how many times to retry the whole thing ---------------
+  # A Job retries a failed Pod with exponential backoff (10s, 20s, 40s...). After
+  # `backoffLimit` failures it gives up and reports Failed.
+  #
+  # WHY 3 AND NOT 0, AND NOT 10:
+  #   Not 0, because a plausible failure here is TRANSIENT: Postgres may not be
+  #   accepting connections yet on a cold cluster. Retrying fixes that for free.
+  #   Not 10, because a BROKEN MIGRATION fails deterministically, and ten retries
+  #   with exponential backoff just means you wait several minutes to learn what
+  #   you knew after the first attempt. Worse, a partially-applied migration can
+  #   fail differently on each retry, which muddies the diagnosis.
+  #
+  #   3 is "absorb a cold start, fail fast on a real bug".
+  backoffLimit: 3
+
+  # ---- ttlSecondsAfterFinished: automatic cleanup --------------------------
+  # Delete this Job (and its Pod) 600s after it finishes, succeeded or failed.
+  #
+  # WHY BOTHER: without a TTL, completed Jobs and their Pods accumulate in the
+  # namespace forever. In a real cluster that means `kubectl get pods` becomes
+  # unreadable, and thousands of retained Job objects genuinely bloat etcd.
+  #
+  # ⚠️ THE COST YOU MUST KNOW ABOUT: when the Job is deleted, ITS LOGS GO WITH
+  # IT. `kubectl logs job/tasks-api-migrate` will say "not found" 10 minutes
+  # after the fact. If a migration fails at 2am and you look at 9am, the evidence
+  # is gone.
+  #
+  #   That is only acceptable if logs are SHIPPED SOMEWHERE ELSE (Loki, ELK,
+  #   CloudWatch). On this learning cluster they aren't, so 600s is a deliberate
+  #   compromise: long enough to investigate while you're at the keyboard, short
+  #   enough to keep the namespace tidy. Raise it — or drop the field — if you'd
+  #   rather keep evidence than tidiness. There's no universally right answer,
+  #   only a choice you should make on purpose.
+  ttlSecondsAfterFinished: 600
+
+  # ---- Fields worth knowing exist, deliberately left at defaults ----------
+  #   completions: 1   — how many successful Pods constitute "done" (default 1).
+  #   parallelism: 1   — how many Pods run at once (default 1).
+  #                      For migrations these MUST stay at 1. Setting parallelism
+  #                      higher recreates the exact concurrency bug this file
+  #                      exists to fix.
+  #   activeDeadlineSeconds — a hard wall-clock cap on the whole Job, overriding
+  #                      backoffLimit. Worth setting (e.g. 600) for a migration
+  #                      that could HANG on a lock rather than fail: without it,
+  #                      a Job blocked on a table lock waits forever and your
+  #                      deploy pipeline hangs with it. Left unset here only
+  #                      because these migrations are tiny; add it when they
+  #                      aren't.
+  #   suspend: true    — creates the Job without starting it. Handy for
+  #                      pre-staging work you'll release manually.
+
+  template:
+    metadata:
+      labels:
+        app: tasks-api
+        component: migration
+    spec:
+      # ---- restartPolicy: Job Pods cannot use the default -------------------
+      # For a Job, restartPolicy MUST be OnFailure or Never. `Always` (the Pod
+      # default, and the only valid value for a Deployment) is rejected — a Pod
+      # that always restarts can never "complete", which contradicts what a Job
+      # is.
+      #
+      #   OnFailure — the KUBELET restarts the failed CONTAINER inside the same
+      #               Pod. Faster (no rescheduling, image already local) and
+      #               retains the Pod object.
+      #   Never     — the container is not restarted; the JOB CONTROLLER creates
+      #               a whole NEW Pod for each attempt.
+      #
+      # WE CHOOSE OnFailure for speed. The trade-off is worth knowing: with
+      # OnFailure, each retry OVERWRITES the previous attempt's logs in the same
+      # container, so you can only easily read the latest failure. With Never you
+      # get one Pod per attempt and can inspect each one's logs independently —
+      # which is genuinely better when you're debugging a flaky migration. Switch
+      # to Never while investigating; switch back after.
+      restartPolicy: OnFailure
+
+      # ---- initContainer: wait for the database ---------------------------
+      # WHY THIS IS NECESSARY, and it's the single most important ordering fact
+      # in this whole repo:
+      #
+      #   `kubectl apply -f k8s/` orders CREATION, not READINESS. The numeric
+      #   filename prefixes guarantee the Postgres StatefulSet is CREATED before
+      #   this Job. They guarantee nothing about Postgres being ready to accept
+      #   connections — that takes 10-30 seconds on a cold start while the image
+      #   pulls and initdb runs.
+      #
+      #   So without this initContainer, on a fresh cluster the migration reliably
+      #   fails its first attempt, then succeeds on retry. Which "works", and is
+      #   exactly the kind of noise that trains you to ignore red output.
+      #
+      # WHY AN initContainer RATHER THAN A RETRY LOOP IN THE APP:
+      #   initContainers run to completion, IN ORDER, before any app container
+      #   starts. They're the standard Kubernetes idiom for "wait for a
+      #   precondition". Advantages over handling it in application code:
+      #     • The dependency is visible in the manifest, not buried in Python.
+      #     • The main container's logs contain only migration output, not
+      #       twenty connection-retry lines.
+      #     • `kubectl get pod` shows `Init:0/1`, which tells you precisely what
+      #       it's waiting on. Self-diagnosing failure states are worth a lot.
+      initContainers:
+        - name: wait-for-postgres
+
+          # Reuse the postgres image purely because it already contains
+          # pg_isready. No extra image to pull (it's cached from the StatefulSet),
+          # and no need for a `busybox + nc` loop that only checks TCP.
+          #
+          # pg_isready is the better check for the reason 20-postgres.yaml
+          # explains: the TCP port opens BEFORE Postgres will accept queries, so
+          # a `nc -z` loop can succeed while the database still refuses
+          # connections — and then the migration fails anyway, having "waited".
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - sh
+            - -c
+            # `until ... do sleep; done` — no explicit attempt cap. Unbounded
+            # loops make people nervous, so be clear about why it's safe here:
+            # the Pod's own lifecycle bounds it. If Postgres never comes up, this
+            # sits in Init: forever and shows up loudly in `kubectl get pods` as
+            # a stuck Pod — which is a better outcome than exiting after N tries
+            # and letting the Job burn its backoffLimit on a database that isn't
+            # coming. Add activeDeadlineSeconds at the Job level if you want a
+            # hard cap.
+            - |
+              echo "waiting for postgres to accept connections..."
+              until pg_isready -h postgres -p 5432 -U tasks; do
+                echo "  postgres not ready yet, retrying in 2s"
+                sleep 2
+              done
+              echo "postgres is ready"
+
+          # initContainers need resources too. They count toward the Pod's
+          # scheduling footprint — specifically, the Pod's effective request is
+          # max(largest init container, sum of app containers), because init
+          # containers run sequentially and never overlap with app containers.
+          # Getting this wrong doesn't error, it just makes the scheduler's view
+          # of your Pod slightly wrong.
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "10m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+
+      containers:
+        - name: migrate
+
+          # ---- THE SAME IMAGE AS THE APPLICATION -----------------------------
+          # This is why the Dockerfile copies `migrations/` and `alembic.ini`
+          # into the image alongside `src/`. It means:
+          #
+          #   • The migration code and the application code are ALWAYS the same
+          #     version. This eliminates an entire class of bug where the schema
+          #     is migrated to version N while the app expects N-1 — the failure
+          #     mode there is "column does not exist" in production, which is
+          #     both alarming and slow to diagnose.
+          #   • No second image to build, version, scan, or push.
+          #
+          # THE COST: the app image carries Alembic and the migration scripts it
+          # doesn't need at runtime — a slightly larger image and a marginally
+          # wider dependency surface. Separate migration images exist for that
+          # reason. For a single service the version-lockstep guarantee is worth
+          # far more than a few MB, and being able to say WHY you chose it is the
+          # point.
+          image: tasks-api:0.1.0
+
+          # ⚠️ CRITICAL, and the #1 cause of "why is my Pod ImagePullBackOff":
+          #   This image is built LOCALLY and exists in no registry. With the
+          #   default policy, Kubernetes would try to pull `tasks-api:0.1.0` from
+          #   Docker Hub, fail, and sit in ImagePullBackOff.
+          #
+          #   `IfNotPresent` says "use the local copy if it exists". Combined with
+          #   a version tag (NOT `:latest`, which forces Always — a special-cased
+          #   default that catches people constantly), local images work.
+          #
+          #   Also required on Rancher Desktop: the image must be in the cluster's
+          #   OWN image store, not just your local Docker daemon. See k8s/README.md
+          #   for the build command that puts it in the right place. `docker images`
+          #   showing the image is NOT proof the cluster can see it.
+          imagePullPolicy: IfNotPresent
+
+          # `alembic upgrade head` — apply every migration from the current
+          # database revision up to the newest one on disk.
+          #
+          # Naturally idempotent when run SEQUENTIALLY: if the database is already
+          # at head, it does nothing and exits 0. That's what makes it safe to
+          # re-run, and it's why the ONLY problem was concurrency.
+          #
+          # NOTE the argv form rather than a shell string. `command` with a list
+          # execs the binary directly — no shell involved. That matters for
+          # signal handling: with `sh -c "alembic ..."` the shell is PID 1 and
+          # often does not forward SIGTERM to its child, so the container ignores
+          # graceful termination and gets SIGKILLed after the grace period. Only
+          # use `sh -c` when you genuinely need shell features (as the
+          # initContainer above does for its loop).
+          command: ["alembic", "upgrade", "head"]
+
+          # ---- Environment: same sources as the app --------------------------
+          # The migration needs DATABASE_URL, and it must be the SAME value the
+          # app uses — otherwise you migrate one database and query another,
+          # which produces the memorable symptom of a migration that "succeeded"
+          # while the app still reports missing tables.
+          #
+          # Pulling from the same ConfigMap and Secret makes that impossible by
+          # construction. This is a good general habit: don't restate a value in
+          # two places when you can reference one source. Every duplicated
+          # config value is a future drift bug.
+          envFrom:
+            - configMapRef:
+                name: tasks-api-config
+            - secretRef:
+                name: tasks-api-secrets
+          # ⚠️ ORDER MATTERS IF KEYS COLLIDE: later sources override earlier ones,
+          # and an explicit `env:` entry beats everything in `envFrom`. There's no
+          # collision here (the ConfigMap deliberately omits DATABASE_URL), but
+          # when there is one, nothing warns you — the value just silently comes
+          # from the last source that defines it.
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+              # A migration is short-lived and bursty, so a generous CPU limit is
+              # cheap: it isn't reserved, only capped, so nothing is wasted when
+              # the Job isn't running. Memory headroom matters if a data migration
+              # ever loads rows into Python — a schema-only migration barely uses
+              # any, but the failure if it does is an OOMKill mid-migration, which
+              # is the worst possible time.
+
+          # Same hardening as the app. Migrations run the same code, so the same
+          # posture applies — and the Dockerfile already creates uid 1000
+          # (`appuser`) and sets USER, so this is confirming intent rather than
+          # changing behaviour.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            # Alembic writes nothing to disk (it writes to the DATABASE), and
+            # PYTHONDONTWRITEBYTECODE=1 in the Dockerfile prevents .pyc files.
+            # Without that env var, Python would try to write __pycache__ next to
+            # the source and this flag would break the container — a nice example
+            # of an image-level decision enabling a cluster-level one.
+
+# ==============================================================================
+# RUNNING IT, AND HOW TO GUARANTEE ORDERING WITH PLAIN kubectl
+# ==============================================================================
+#   # Re-runnable sequence (delete first, because the template is immutable):
+#   kubectl delete job tasks-api-migrate -n tasks-api --ignore-not-found
+#   kubectl apply -f k8s/30-migration-job.yaml
+#
+#   # THE MISSING PIECE: block until it actually finished before deploying the
+#   # app. This is the line that turns "creation order" into "readiness order":
+#   kubectl wait --for=condition=complete --timeout=120s \
+#     job/tasks-api-migrate -n tasks-api
+#
+#   # ⚠️ `--for=condition=complete` does NOT return early on failure — it waits
+#   #    out the full timeout. To fail fast, wait on either condition:
+#   #      kubectl wait --for=condition=complete job/... &
+#   #      kubectl wait --for=condition=failed job/... && exit 1
+#   #    In practice, this awkwardness is a large part of why real pipelines use
+#   #    Helm hooks or ArgoCD waves instead of hand-rolled kubectl sequencing.
+#
+#   # Watch it / read output:
+#   kubectl get job tasks-api-migrate -n tasks-api -w
+#   kubectl logs -n tasks-api job/tasks-api-migrate
+#   kubectl logs -n tasks-api job/tasks-api-migrate -c wait-for-postgres
+#   #                                                ^ -c selects the init
+#   #                                                  container; without it you
+#   #                                                  get the main one only
+#
+#   # Verify from the database side (proof, not inference):
+#   kubectl exec -n tasks-api postgres-0 -- \
+#     psql -U tasks -d tasks -c "SELECT version_num FROM alembic_version;"
+#   kubectl exec -n tasks-api postgres-0 -- psql -U tasks -d tasks -c "\dt"
+#
+# WHAT ELSE HAS TO CHANGE FOR THIS TO BE THE REAL FIX:
+#   The Deployment's container command must NOT run migrations. It should start
+#   uvicorn ONLY (which the Dockerfile's CMD already does — so as long as
+#   40-deployment.yaml sets no `command`/`args`, you're correct by default).
+#   docker-compose.yml keeps its `sh -c "alembic upgrade head && uvicorn ..."`
+#   chain, and that's fine: one container locally means no concurrency, and it
+#   keeps local dev a single command. Different environment, different correct
+#   answer — worth being able to say so rather than "fixing" compose too.
+# ==============================================================================

@@ -1,0 +1,60 @@
+# ==============================================================================
+# requirements.txt — the exact runtime dependencies for this project.
+#
+# WHY PINNED VERSIONS (==)?
+#   Reproducibility. "It works on my machine" bugs almost always come from
+#   different dependency versions. Pinning means every machine + CI + Docker
+#   image installs the SAME versions, so behavior is identical everywhere.
+#
+# INSTALL:  pip install -r requirements.txt
+# (dev/test-only tools live in requirements-dev.txt so production images stay lean)
+# ==============================================================================
+
+# ---- Web framework + server ----
+# fastapi: the framework itself (routing, validation, OpenAPI, dependency injection).
+fastapi==0.115.6
+# uvicorn: the ASGI server that actually runs the app. [standard] pulls in fast
+# extras (uvloop where available, httptools, websockets). ASGI = the async
+# successor to WSGI; it's what lets FastAPI serve async def handlers.
+uvicorn[standard]==0.34.0
+
+# ---- Configuration ----
+# pydantic-settings: reads config from environment variables / .env into a typed
+# Settings object. Pydantic v2 split settings out into this separate package.
+pydantic-settings==2.7.1
+# EmailStr and other niceties need this optional dependency of pydantic.
+email-validator==2.2.0
+
+# ---- Database (async) ----
+# SQLAlchemy 2.x: the ORM. [asyncio] enables the async engine/session APIs.
+sqlalchemy[asyncio]==2.0.36
+# aiosqlite: async driver for SQLite. Lets us run with zero external DB.
+aiosqlite==0.20.0
+# asyncpg: async driver for PostgreSQL. Installed so switching to Postgres is a
+# one-line env change with no code edits. (Harmless if you never use Postgres.)
+asyncpg==0.30.0
+# alembic: database migrations (versioned, repeatable schema changes).
+alembic==1.14.0
+# greenlet: SQLAlchemy's async layer bridges sync/async via greenlet. Usually
+# pulled in automatically, pinned here to be explicit and avoid surprises.
+greenlet==3.1.1
+
+# ---- Security / auth ----
+# python-jose: encode/decode/verify JWTs. [cryptography] provides the crypto backend.
+python-jose[cryptography]==3.3.0
+# passlib: password hashing framework. [bcrypt] selects the bcrypt algorithm.
+passlib[bcrypt]==1.7.4
+# bcrypt pinned: passlib 1.7.4 breaks against bcrypt>=4.1 (a well-known compat
+# issue). 4.0.1 is the last version that reads passlib's version probe cleanly.
+bcrypt==4.0.1
+# python-multipart: required by FastAPI to parse form data — the OAuth2 login
+# form (username/password) arrives as multipart/form-data, not JSON.
+python-multipart==0.0.20
+
+# ---- Rate limiting ----
+# slowapi: rate limiting for Starlette/FastAPI (wraps the "limits" library).
+slowapi==0.1.9
+
+# ---- Caching / Redis ----
+# redis: official client. Modern versions include asyncio support (redis.asyncio).
+redis==5.2.1

@@ -1,0 +1,95 @@
+# ------------------------------------------------------------------------------
+# .gitignore — tells git which files to NEVER commit.
+# WHY: secrets (.env), generated artifacts (__pycache__), and local-only files
+# (the virtualenv, the sqlite db) should not live in version control. Committing
+# a virtualenv bloats the repo and breaks on other machines; committing .env
+# leaks credentials.
+# ------------------------------------------------------------------------------
+
+# Python bytecode caches — regenerated automatically, never useful in git.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment — machine-specific, huge, recreated from requirements.txt.
+.venv/
+venv/
+env/
+
+# Environment variables — SECRETS LIVE HERE. Never commit. Commit .env.example instead.
+.env
+
+# Local SQLite database files (we use sqlite for zero-setup local dev).
+*.db
+*.sqlite
+*.sqlite3
+
+# Test / coverage artifacts.
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# IDE / editor noise.
+.vscode/
+.idea/
+*.swp
+
+# OS noise.
+.DS_Store
+Thumbs.db
+
+# mypy / ruff caches
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling config — machine-specific, of no use to anyone cloning this.
+.claude/
+
+# ------------------------------------------------------------------------------
+# KUBERNETES
+#
+# WHY THIS SECTION EXISTS:
+#   The k8s/ directory contains manifests, and one of them exists purely to hold
+#   credentials. A Kubernetes Secret manifest is NOT encrypted — the values are
+#   base64-ENCODED, which is reversible with a single command:
+#
+#       echo 'c3VwZXItc2VjcmV0' | base64 -d      ->  super-secret
+#
+#   So committing a Secret manifest is exactly as bad as committing a plaintext
+#   password. Worse, in fact: base64 looks scrambled enough that people assume
+#   it's safe, and it survives in git history forever after the "fix".
+#
+# THE RULE:
+#   Commit a *.example.yaml template with placeholder values (so anyone cloning
+#   knows which keys exist — same pattern as .env.example above).
+#   Never commit the file with the real values in it.
+# ------------------------------------------------------------------------------
+
+# Any manifest with "secret" in the name is ignored by default...
+*secret*.yaml
+*secret*.yml
+
+# ...EXCEPT the placeholder templates, which are safe and belong in git.
+# NOTE: this negation MUST come after the rules above — git applies the LAST
+# matching pattern, so reversing these two blocks would silently ignore the
+# templates too.
+!*secret*.example.yaml
+!*secret*.example.yml
+
+# Kubeconfig files: these hold cluster API endpoints and client certificates,
+# i.e. everything needed to authenticate as you against a cluster.
+kubeconfig
+*.kubeconfig
+.kube/
+
+# TLS keys and certificates. The private key is the whole ballgame.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Helm dependency downloads (vendored charts) — recreate with `helm dep update`.
+k8s/**/charts/
+*.tgz

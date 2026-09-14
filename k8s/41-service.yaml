@@ -1,0 +1,268 @@
+# ==============================================================================
+# 41-service.yaml — a stable address for the application's Pods.
+#
+# THE PROBLEM A SERVICE SOLVES — and you have to understand the problem before
+# the object makes any sense:
+#
+#   Every Pod gets its own cluster-internal IP. Those IPs are EPHEMERAL. A Pod
+#   that is restarted, rescheduled, replaced by a rollout, or scaled away gets a
+#   different IP. There is no stability whatsoever. So a client cannot hold onto
+#   a Pod IP, and a client cannot discover Pod IPs without watching the API.
+#
+#   A Service gives you ONE virtual IP (and one DNS name) that does not change
+#   for the Service's whole lifetime, and it load-balances across whichever Pods
+#   currently match its selector. Pods come and go underneath; the address holds.
+#
+# HOW IT ACTUALLY WORKS — the part that gets asked, and the part almost everyone
+# describes wrongly:
+#
+#   1. You create a Service with a `selector`.
+#   2. The ENDPOINTS controller watches for Pods matching that selector that are
+#      also READY, and writes their IPs into an EndpointSlice object.
+#   3. kube-proxy on EVERY node watches EndpointSlices and programs the node's
+#      kernel — iptables rules (or IPVS tables) that DNAT the Service's virtual IP
+#      to one of the Pod IPs.
+#   4. CoreDNS creates an A record so `tasks-api` resolves to the Service IP.
+#
+#   ⚠️ THE CRUCIAL CONSEQUENCE: kube-proxy is NOT A PROXY IN THE DATA PATH.
+#      Nothing hops through a load-balancer process. The kernel rewrites the
+#      destination address of the packet and it goes straight to the Pod. There
+#      is no extra network hop, no single point of failure, and no process to
+#      saturate. The Service "IP" is not assigned to any network interface
+#      anywhere — it exists only as a match target in kernel rules, which is why
+#      you cannot ping it.
+#
+#      Saying "kube-proxy load-balances the traffic" is the common answer. Saying
+#      "kube-proxy PROGRAMS THE KERNEL to load-balance; the traffic never touches
+#      kube-proxy" is the correct one, and the difference is noticed.
+#
+# ⚠️ THE #1 SERVICE BUG, AND IT FAILS SILENTLY:
+#      A selector that matches nothing produces a Service with ZERO endpoints.
+#      No error. No warning. No event. `kubectl get svc` looks completely healthy
+#      — it shows an IP and a port, because the Service object is fine. Only the
+#      routing is empty. Connections then hang or get refused.
+#
+#      SO: when a Service "doesn't work", the FIRST command is never `get svc`:
+#          kubectl get endpoints tasks-api -n tasks-api
+#          kubectl get endpointslices -n tasks-api
+#      Empty ENDPOINTS means either (a) the selector doesn't match any Pod's
+#      labels, or (b) matching Pods exist but are NOT READY. Those two causes
+#      look identical from the Service and need completely different fixes, so
+#      check `kubectl get pods -l app=tasks-api,component=api` next.
+#
+#      Module 04 has you introduce this typo deliberately, because reading about
+#      it does not build the reflex.
+# ==============================================================================
+
+apiVersion: v1                   # Core group. Services predate the `apps` group.
+kind: Service
+
+metadata:
+  name: tasks-api
+  # ⚠️ THIS NAME IS THE DNS HOSTNAME. Consequences:
+  #      In-namespace:   http://tasks-api:8000
+  #      Cross-namespace: http://tasks-api.tasks-api:8000
+  #      Fully qualified: http://tasks-api.tasks-api.svc.cluster.local:8000
+  #
+  #    The short form works because a Pod's /etc/resolv.conf contains:
+  #      search tasks-api.svc.cluster.local svc.cluster.local cluster.local
+  #      options ndots:5
+  #
+  #    Two things worth knowing about that:
+  #      • The search path is why `tasks-api` resolves but `tasks-api.` (with a
+  #        trailing dot, meaning absolute) does not.
+  #      • `ndots:5` means any name with FEWER than 5 dots is tried against every
+  #        search domain FIRST. So looking up `api.github.com` (2 dots) generates
+  #        four failed queries before the real one. That's a genuine, measurable
+  #        source of DNS latency in Kubernetes, and the fix is either a trailing
+  #        dot on external hostnames or a custom `dnsConfig` with a lower ndots.
+  #        Worth knowing — "why is DNS slow in our cluster" is a real interview
+  #        question with this as the answer.
+  namespace: tasks-api
+  labels:
+    app: tasks-api
+    component: api
+
+spec:
+  # ---- type: THE DECISION IN THIS FILE -------------------------------------
+  # The four types, what each adds, and when each is right:
+  #
+  #   ClusterIP (default)
+  #     A virtual IP reachable ONLY from inside the cluster.
+  #     Right for: everything internal. Also the correct choice for anything
+  #     that will be exposed through an Ingress — the Ingress controller runs
+  #     INSIDE the cluster, so it reaches a ClusterIP perfectly well.
+  #
+  #   NodePort
+  #     ClusterIP, PLUS it opens the same high port (30000-32767 by default) on
+  #     EVERY node. Reach the app at <any-node-ip>:<nodePort>.
+  #     Right for: quick manual testing, bare-metal clusters with an external
+  #     load balancer in front.
+  #     Wrong for production because: the port number is ugly and arbitrary, you
+  #     must know a node IP (which changes), it's one port per Service across the
+  #     whole cluster, and it exposes the port on every node whether you want it
+  #     there or not.
+  #
+  #   LoadBalancer
+  #     NodePort, PLUS it asks the cloud provider to provision a real external
+  #     load balancer (an ELB/ALB, a GCP forwarding rule, an Azure LB).
+  #     Right for: a small number of genuinely public L4 endpoints.
+  #     ⚠️ THE COST PEOPLE MISS: one cloud load balancer PER SERVICE, each with a
+  #        monthly bill and its own public IP. Ten services = ten load balancers.
+  #        This is the single strongest financial argument for an Ingress: one
+  #        load balancer fronting many services, routed by hostname and path.
+  #     On k3s/Rancher Desktop this still works — klipper-lb (the `svclb-*` Pods)
+  #     fakes it by binding the port on the node. Convenient locally, and worth
+  #     knowing it is NOT what happens in the cloud.
+  #
+  #   ExternalName
+  #     No proxying at all — just a CNAME to an external DNS name. Right for
+  #     giving an out-of-cluster dependency (a managed database) an in-cluster
+  #     name, so you can later swap it for a real Service without changing any
+  #     client config. A genuinely useful migration tool.
+  #
+  # WE CHOOSE ClusterIP because 42-ingress.yaml handles external access. The
+  # layering is deliberate:
+  #     internet -> Ingress (L7: hostnames, paths, TLS) -> Service (L4) -> Pods
+  # Making this a NodePort "just in case" would open a port on every node for no
+  # benefit — an unnecessary attack surface, which is the kind of default nobody
+  # ever revisits.
+  #
+  # AND NOTE — you do not need NodePort to test locally. `kubectl port-forward`
+  # tunnels to a ClusterIP Service (or straight to a Pod) over the API server,
+  # with no cluster change at all:
+  #     kubectl port-forward -n tasks-api svc/tasks-api 8000:8000
+  type: ClusterIP
+
+  # ---- selector: which Pods receive traffic --------------------------------
+  # MUST match the labels in 40-deployment.yaml's spec.template.metadata.labels.
+  #
+  # Note what is NOT here: any reference to the Deployment. A Service has no idea
+  # Deployments exist. It matches LABELS ON PODS, full stop. That indirection is
+  # Kubernetes' central design idea, and it has real consequences:
+  #   • You can point a Service at Pods created by anything — a Deployment, a
+  #     StatefulSet, a bare Pod, two Deployments at once.
+  #   • Blue/green deployments are trivial: run two Deployments with labels
+  #     `version: blue` and `version: green`, and switch traffic by EDITING THIS
+  #     SELECTOR. One field change is your cutover, and reverting is the same
+  #     change back.
+  #   • And the flip side: a careless selector can capture Pods you didn't intend,
+  #     silently sending production traffic somewhere surprising.
+  #
+  # BOTH labels are required (it's an AND, never an OR). Using only
+  # `app: tasks-api` would also match the migration Job's Pods — which do not
+  # listen on port 8000 at all — so a fraction of requests would fail with
+  # connection refused while the Job was running. Intermittent, timing-dependent,
+  # and very hard to attribute. Specific selectors are cheap insurance.
+  selector:
+    app: tasks-api
+    component: api
+
+  ports:
+    - name: http
+      # `port` — the port on the SERVICE. What clients connect to.
+      # We keep it 8000, matching the container, purely so there's one number to
+      # remember. Many teams standardise Services on port 80 regardless of the
+      # container port; both are fine, and consistency beats either choice.
+      port: 8000
+
+      # `targetPort` — the port on the POD. BY NAME, referencing the
+      # `name: http` port declared in 40-deployment.yaml.
+      #
+      # WHY BY NAME RATHER THAN THE NUMBER 8000:
+      #   The port number then lives in exactly ONE place (the Deployment).
+      #   Change the container port and this Service follows automatically. With
+      #   a hardcoded 8000 you must remember to edit both, and forgetting gives
+      #   you a Service with healthy-looking endpoints that refuses every
+      #   connection.
+      #
+      # ⚠️ IF THE NAME DOESN'T MATCH any container port, you get endpoints that
+      #    look correct and connections that fail. The typo is in the Service; the
+      #    symptom is in the app. `kubectl get endpoints` will show the resolved
+      #    port, which is how you catch it.
+      targetPort: http
+
+      protocol: TCP
+      # TCP, UDP, or SCTP. TCP is the default.
+      #
+      # ⚠️ NOTE WHAT "protocol" MEANS HERE: it is the L4 transport, NOT the
+      #    application protocol. A Service has no idea it's carrying HTTP. It
+      #    cannot route on paths, read headers, or terminate TLS — those are L7
+      #    concerns, and needing them is precisely why an Ingress exists. This is
+      #    the cleanest way to internalise the L4/L7 split: the Service moves
+      #    bytes to a Pod; the Ingress understands what the bytes mean.
+
+  # ---- Fields worth knowing about, deliberately left at defaults -----------
+  #
+  # sessionAffinity: ClientIP
+  #   Pins a client IP to the same Pod for a period (default 3h).
+  #   NOT set here, on purpose, and the reason is worth internalising: this app
+  #   is STATELESS — JWT auth means any replica can serve any request, and shared
+  #   state lives in Postgres and Redis. Session affinity would give you WORSE
+  #   load distribution (one heavy client pinned to one Pod) for zero benefit.
+  #
+  #   If you ever find yourself NEEDING sessionAffinity, treat it as a signal
+  #   that state has leaked into your processes. It's a workaround for a design
+  #   problem, not a feature — and it doesn't even work reliably, because it keys
+  #   on client IP, so everyone behind one corporate NAT is "the same client".
+  #
+  # publishNotReadyAddresses: true
+  #   Include NOT-READY Pods in the endpoints. Sounds insane, and is exactly
+  #   right for one case: clustered software whose members must discover each
+  #   other BEFORE any of them can become ready (a Cassandra or Elasticsearch
+  #   ring). A chicken-and-egg readiness problem. Never for a web API.
+  #
+  # externalTrafficPolicy: Local   (NodePort/LoadBalancer only)
+  #   By default a node receiving external traffic may forward it to a Pod on
+  #   ANOTHER node — which costs an extra hop and, crucially, SNATs the packet so
+  #   the real client IP is lost. `Local` only routes to Pods on the receiving
+  #   node, preserving the client IP.
+  #   The trade-off: traffic to a node with no local Pod is DROPPED, so you need
+  #   the load balancer's health checks to know that. This is the answer to "why
+  #   do all my access logs show a node IP instead of the real client IP?", which
+  #   is a common and confusing production question.
+  #
+  # ipFamilyPolicy / ipFamilies — dual-stack IPv4/IPv6. Out of scope here.
+  #
+  # topologyKeys / trafficDistribution: PreferClose (1.31+)
+  #   Prefer endpoints in the same zone to cut cross-zone traffic cost and
+  #   latency. Relevant on a multi-zone cloud cluster; meaningless on one node.
+
+# ==============================================================================
+# VERIFYING THIS — the commands, in the order a working debugging habit uses them
+# ==============================================================================
+#   # 1. Does the Service exist, and what is its virtual IP?
+#   kubectl get svc tasks-api -n tasks-api
+#
+#   # 2. THE IMPORTANT ONE. Does it have endpoints? Empty here = your bug.
+#   kubectl get endpoints tasks-api -n tasks-api
+#   kubectl get endpointslices -n tasks-api -l kubernetes.io/service-name=tasks-api
+#   #   (EndpointSlices are the modern, scalable replacement for Endpoints — one
+#   #    Endpoints object holding 5,000 IPs had to be rewritten in full on every
+#   #    single Pod change, which melted the API server on large clusters. Slices
+#   #    cap at 100 endpoints each. `kubectl get endpoints` still works because
+#   #    the old object is maintained for compatibility.)
+#
+#   # 3. If endpoints are empty: do matching Pods exist, and are they READY?
+#   kubectl get pods -n tasks-api -l app=tasks-api,component=api
+#   #   Running but 0/1 READY means the readiness probe is failing — the Pods
+#   #   exist and the selector is fine. Completely different fix from a typo.
+#
+#   # 4. Test from INSIDE the cluster. This is the real test: a ClusterIP is not
+#   #    reachable from your laptop at all, so testing from outside proves nothing.
+#   kubectl run -n tasks-api tmp-curl --rm -it --restart=Never \
+#     --image=curlimages/curl -- curl -sS http://tasks-api:8000/health
+#
+#   # 5. Check DNS resolution specifically, if step 4 fails:
+#   kubectl run -n tasks-api tmp-dns --rm -it --restart=Never \
+#     --image=busybox:1.36 -- nslookup tasks-api.tasks-api.svc.cluster.local
+#
+#   # 6. Reach it from your machine without changing the cluster:
+#   kubectl port-forward -n tasks-api svc/tasks-api 8000:8000
+#   #   then: curl http://localhost:8000/health
+#   #
+#   #   ⚠️ Worth knowing: port-forward to a SERVICE picks ONE Pod and keeps the
+#   #      tunnel there — it does not load-balance across replicas. So it will not
+#   #      reveal problems that only affect some Pods, and it is not a way to test
+#   #      load balancing. Use step 4 (in-cluster curl in a loop) for that.
+# ==============================================================================

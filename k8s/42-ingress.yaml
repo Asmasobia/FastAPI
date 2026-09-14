@@ -1,0 +1,405 @@
+# ==============================================================================
+# 42-ingress.yaml — external HTTP access, routed by hostname and path.
+#
+# WHY THIS EXISTS WHEN WE ALREADY HAVE A SERVICE — the L4/L7 split:
+#
+#   A Service works at LAYER 4. It moves TCP bytes to a Pod. It cannot read a
+#   hostname, cannot see a URL path, cannot inspect a header, and cannot
+#   terminate TLS, because doing any of those requires understanding HTTP, and a
+#   Service does not.
+#
+#   An Ingress works at LAYER 7. It parses HTTP, so it can:
+#     • route by HOSTNAME       api.example.com -> service A
+#                               app.example.com -> service B
+#     • route by PATH           /api    -> backend
+#                               /       -> frontend
+#     • terminate TLS           one certificate, many backends
+#     • add L7 behaviour        redirects, rate limits, auth, header rewriting
+#
+#   THE ECONOMIC ARGUMENT, which is usually the one that actually decides it:
+#   `type: LoadBalancer` provisions ONE CLOUD LOAD BALANCER PER SERVICE, each
+#   with its own monthly bill and its own public IP. Ten services = ten load
+#   balancers. An Ingress puts ONE load balancer in front of the ingress
+#   controller, and everything else is routed internally by hostname and path.
+#   That's a large recurring cost difference, and it's the sort of reasoning that
+#   distinguishes "I know the objects" from "I know why to use them".
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ THE MOST IMPORTANT THING TO UNDERSTAND ABOUT INGRESS:                    │
+# │                                                                          │
+# │ AN INGRESS OBJECT DOES NOTHING BY ITSELF. It is pure configuration —     │
+# │ a set of routing rules stored in etcd. Something has to READ it.         │
+# │                                                                          │
+# │ That something is an INGRESS CONTROLLER: a real Pod (nginx, Traefik,     │
+# │ HAProxy, Envoy) running in the cluster, watching Ingress objects, and    │
+# │ reconfiguring itself to match.                                           │
+# │                                                                          │
+# │ Apply an Ingress to a cluster with no controller and NOTHING HAPPENS.    │
+# │ No error. `kubectl get ingress` shows the object, ADDRESS stays empty    │
+# │ forever, and requests go nowhere. This is the single most common Ingress │
+# │ confusion, and the empty ADDRESS column is the tell.                     │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+#   We're fine here: k3s (which Rancher Desktop runs) BUNDLES TRAEFIK. Confirm it:
+#       kubectl get pods -n kube-system | grep traefik
+#       kubectl get ingressclass
+#
+# CONTROLLER CHOICE — a real decision, stated as one:
+#   ingress-nginx  The most widely deployed; the largest body of documentation
+#                  and StackOverflow answers; a huge annotation surface. If you
+#                  are learning for the job market, this is the one you'll most
+#                  often meet.
+#   Traefik        Bundled with k3s (so: zero setup here), a nicer CRD-based
+#                  config model, automatic Let's Encrypt. Fewer examples online.
+#   Envoy-based    (Contour, Emissary, Istio gateways) More powerful, notably
+#                  more complexity.
+#
+#   WE USE TRAEFIK because it is already running and installing a second
+#   controller on a learning cluster buys confusion, not knowledge. Standard
+#   Ingress fields are portable across all of them — it's the ANNOTATIONS that
+#   are controller-specific, which is exactly why the rules below stick to
+#   standard fields and keep annotations to a minimum. That portability is a
+#   design goal, not an accident.
+#
+#   REVISIT IF: you want ingress-nginx-specific experience for interviews, or you
+#   need an annotation Traefik lacks. Swapping means changing `ingressClassName`
+#   and rewriting annotations — the rules themselves survive.
+#
+# ⚠️ AND THE FORWARD-LOOKING NOTE: Ingress is effectively FROZEN. Its successor
+#    is the GATEWAY API (Gateway, HTTPRoute, GRPCRoute), which fixes Ingress's
+#    real design flaws: the annotation free-for-all, no way to split
+#    infrastructure ownership from route ownership, and no first-class support
+#    for traffic splitting or header matching. New projects on modern clusters
+#    should look at Gateway API. Ingress is still what you'll find in the vast
+#    majority of existing clusters, so learn it first — and knowing that it's
+#    being superseded, and precisely why, is itself a strong signal.
+# ==============================================================================
+
+apiVersion: networking.k8s.io/v1
+# ⚠️ NOTE THE GROUP AND VERSION. Older tutorials show `extensions/v1beta1` or
+#    `networking.k8s.io/v1beta1`. Both were REMOVED in Kubernetes 1.22. The v1
+#    schema is also genuinely different (`backend.service.name` + `port.number`
+#    instead of `serviceName` + `servicePort`), so copy-pasting an old example
+#    gives you a validation error rather than a working object. If a Kubernetes
+#    example doesn't work, checking the apiVersion first saves a lot of time.
+kind: Ingress
+
+metadata:
+  name: tasks-api
+  namespace: tasks-api
+  # ⚠️ NAMESPACE MATTERS MORE THAN USUAL HERE: an Ingress can only route to
+  #    Services in ITS OWN NAMESPACE. There is no cross-namespace backend
+  #    reference. If you need one hostname fronting services in several
+  #    namespaces, you need one Ingress per namespace sharing the same host —
+  #    which most controllers support but which is genuinely fiddly (and is one
+  #    of the problems Gateway API was designed to solve properly).
+  labels:
+    app: tasks-api
+    component: api
+
+  annotations:
+    # ---- Why annotations exist at all, and why to minimise them ------------
+    # The Ingress SPEC only standardises hostnames, paths, and TLS. Everything
+    # else a real reverse proxy can do — rate limiting, auth, timeouts, body-size
+    # limits, header manipulation, redirects — has no place in the spec. So every
+    # controller invented its own annotations.
+    #
+    # THE CONSEQUENCE: annotations are NOT PORTABLE. An Ingress full of
+    # `nginx.ingress.kubernetes.io/*` annotations is meaningless to Traefik, and
+    # it fails SILENTLY — the controller just ignores keys it doesn't recognise.
+    # So a migration between controllers quietly drops your rate limiting and
+    # your timeouts, and nothing tells you.
+    #
+    # This annotation sprawl is precisely what Gateway API replaced with typed
+    # fields. Keeping the list here short is a deliberate portability choice.
+
+    # Traefik: redirect HTTP to HTTPS.
+    #
+    # WHY IT MATTERS BEYOND TIDINESS: without it, a client that types
+    # `http://tasks.localdev` sends its JWT — a bearer token equivalent to a
+    # password — over plaintext. Anyone on the path can read it and replay it.
+    # Redirecting is not cosmetic; it closes a credential-leak path.
+    #
+    # ⚠️ AND THE LIMIT OF THE FIX: a redirect happens AFTER the plaintext request
+    #    has already been sent. So the first request's headers were still exposed.
+    #    The complete answer is HSTS (Strict-Transport-Security), which tells the
+    #    browser to never use HTTP for this host again. Left out here because HSTS
+    #    on a local dev hostname with a self-signed certificate is a good way to
+    #    permanently break that hostname in your browser — a real trade-off worth
+    #    naming rather than a rule to recite.
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: tasks-api-https-redirect@kubernetescrd
+    # ^ References the Middleware CRD defined at the bottom of this file. The
+    #   `@kubernetescrd` suffix is Traefik's provider namespace syntax, and the
+    #   format is <namespace>-<middleware-name>@kubernetescrd. Getting it wrong
+    #   fails silently (see above) — check the Traefik Pod's logs, which DO
+    #   complain about middleware it cannot resolve.
+
+    # ---- Annotations we are NOT using, and why they're worth knowing -------
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    #   THE PRODUCTION ANSWER FOR TLS. cert-manager watches for this annotation,
+    #   requests a certificate from Let's Encrypt via ACME, proves domain
+    #   ownership (HTTP-01 or DNS-01 challenge), writes the result into the Secret
+    #   named in `tls.secretName` below, and RENEWS IT AUTOMATICALLY before
+    #   expiry. Certificates then stop being an operational task that someone
+    #   forgets until an outage.
+    #
+    #   Not usable here for a concrete reason worth understanding: Let's Encrypt
+    #   must reach your domain from the public internet to validate it. A
+    #   /etc/hosts entry pointing at 127.0.0.1 cannot be validated, so ACME
+    #   HTTP-01 is impossible on a local hostname. (DNS-01 with a real domain you
+    #   control would work even for a private cluster — that's the escape hatch.)
+    #   Hence the self-signed certificate below.
+    #
+    # nginx.ingress.kubernetes.io/proxy-body-size: 10m
+    #   ingress-nginx defaults to a 1MB request body limit and returns 413 above
+    #   it. This surprises people the first time they add file upload — the app is
+    #   fine, the Ingress rejected it. Every proxy has a limit like this; know
+    #   where yours is before you need it.
+    #
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    #   Default is 60s. Any request slower than this returns 504 from the proxy
+    #   even though your app is still working on it. The classic symptom is "long
+    #   reports fail at exactly one minute".
+
+spec:
+  # ---- ingressClassName: which controller should handle this -------------
+  # A cluster can run SEVERAL ingress controllers — commonly an internal-only one
+  # and an internet-facing one. This field says which one owns this Ingress.
+  #
+  # ⚠️ OMITTING IT IS RISKY IN TWO OPPOSITE DIRECTIONS:
+  #    • With no default IngressClass, NO controller claims the Ingress and it
+  #      does nothing (empty ADDRESS, silently).
+  #    • With a default class, it's claimed by whichever controller happens to be
+  #      default — which might be the internet-facing one. That's how an internal
+  #      admin API accidentally becomes public. Being explicit is a security
+  #      decision, not a style preference.
+  #
+  # `traefik` is the class k3s creates. Verify yours rather than trusting this:
+  #     kubectl get ingressclass
+  # (The old way was the `kubernetes.io/ingress.class` ANNOTATION. It's
+  # deprecated but still honoured by most controllers, and you will meet it in
+  # existing manifests.)
+  ingressClassName: traefik
+
+  # ---- TLS ----------------------------------------------------------------
+  tls:
+    - hosts:
+        - tasks.localdev
+      secretName: tasks-api-tls
+      # ⚠️ THIS SECRET MUST EXIST, must be of type `kubernetes.io/tls`, and must
+      #    contain exactly the keys `tls.crt` and `tls.key`. If it's missing,
+      #    Traefik falls back to its own self-signed default certificate, so you
+      #    get a browser warning about the WRONG HOSTNAME and no clue that the
+      #    real cause is a missing Secret. Check the controller's logs.
+      #
+      # It is NOT in this repo, and deliberately not: it contains a private key,
+      # and .gitignore blocks *.key / *.crt / *secret*.yaml precisely so it can't
+      # be committed by accident.
+      #
+      # CREATE IT LOCALLY (self-signed, for local development only):
+      #
+      #   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      #     -keyout tls.key -out tls.crt \
+      #     -subj "/CN=tasks.localdev/O=tasks-api" \
+      #     -addext "subjectAltName=DNS:tasks.localdev"
+      #
+      #   kubectl create secret tls tasks-api-tls \
+      #     --namespace tasks-api \
+      #     --cert=tls.crt --key=tls.key
+      #
+      #   rm tls.key tls.crt     # don't leave the private key lying around
+      #
+      # ⚠️ THE -addext subjectAltName PART IS NOT OPTIONAL. Browsers have ignored
+      #    the Common Name for hostname verification since ~2017 (Chrome 58) and
+      #    require a SAN. A certificate with only /CN= is rejected with
+      #    ERR_CERT_COMMON_NAME_INVALID, which reads like a name mismatch rather
+      #    than a missing field — a genuinely misleading error, and a very common
+      #    hour lost.
+      #
+      # WHAT SELF-SIGNED COSTS YOU, plainly: browsers show a warning, and
+      # `curl` needs `-k`. That's acceptable for local dev and completely
+      # unacceptable in production, where the answer is cert-manager (above).
+      #
+      # WHERE TLS IS TERMINATED, AND WHAT THAT IMPLIES: at the Ingress. Traffic
+      # from Traefik to your Pods is PLAINTEXT HTTP inside the cluster. For most
+      # setups that's the accepted model. If your threat model includes an
+      # attacker on the cluster network, you need mTLS between Pods — which is a
+      # service mesh (Istio, Linkerd), not an Ingress feature. Knowing where
+      # encryption stops is a question worth being able to answer precisely.
+
+  # ---- Routing rules -----------------------------------------------------
+  rules:
+    - host: tasks.localdev
+      # ⚠️ MATCHED AGAINST THE HTTP `Host:` HEADER (or the TLS SNI), not against
+      #    DNS. Two consequences:
+      #      • This works with no DNS record at all, as long as the client sends
+      #        the right Host header:
+      #            curl -k --resolve tasks.localdev:443:127.0.0.1 \
+      #              https://tasks.localdev/health
+      #      • Which is why you can test an Ingress before DNS exists.
+      #
+      #    For browser access you need name resolution, which locally means a
+      #    hosts-file entry:
+      #        Windows: C:\Windows\System32\drivers\etc\hosts   (needs admin)
+      #        macOS/Linux: /etc/hosts                           (needs sudo)
+      #      -> 127.0.0.1 tasks.localdev
+      #
+      #    WHY `.localdev` AND NOT `.local`: `.local` is reserved for mDNS
+      #    (Bonjour/Avahi) by RFC 6762. Using it causes genuinely strange,
+      #    intermittent resolution behaviour on macOS and some Linux setups —
+      #    it works, then doesn't, depending on what else is on the network.
+      #    Avoid it. `.localhost` is reserved and safe by RFC 6761;
+      #    `.internal` and made-up suffixes like `.localdev` are also fine.
+      #    Never use a suffix that could become a real TLD.
+      #
+      # OMITTING `host` ENTIRELY makes the rule match ANY hostname — a catch-all.
+      # Convenient for a single-app cluster, and a real hazard once there are
+      # several Ingresses, because a catch-all can shadow specific hosts in ways
+      # that depend on controller-specific precedence rules.
+      http:
+        paths:
+          - path: /
+            # ---- pathType: A REQUIRED FIELD PEOPLE STILL GET WRONG ----------
+            #   Prefix — matches by URL PATH SEGMENT. `/api` matches `/api` and
+            #            `/api/tasks` but NOT `/apifoo`. Segment-aware, which is
+            #            what you almost always want.
+            #   Exact  — matches the complete path only, case-sensitive. `/health`
+            #            matches `/health` and NOT `/health/`. That trailing-slash
+            #            distinction causes real 404s.
+            #   ImplementationSpecific — controller decides. ingress-nginx treats
+            #            it as a REGEX, which is powerful and a portability trap:
+            #            the same manifest behaves differently on Traefik.
+            #
+            # `Prefix` + `/` = send everything for this host to the backend. Right
+            # here because the app owns the whole hostname: FastAPI routes /health,
+            # /docs, /openapi.json, /api/v1/* itself, and it should keep doing so.
+            # Duplicating its routing table in the Ingress would give you two
+            # places to change for every new endpoint.
+            pathType: Prefix
+            backend:
+              service:
+                name: tasks-api        # The Service in 41-service.yaml. Must be
+                                       # in THIS namespace.
+                port:
+                  number: 8000         # The Service's `port`, NOT the container's
+                                       # targetPort.
+                  # ⚠️ THE TWO-HOP MODEL, because conflating these is a classic
+                  #    mistake: Ingress -> Service.port (8000) -> Pod.targetPort
+                  #    (also 8000 here, resolved from the name `http`). They
+                  #    happen to be equal, which hides the distinction. If the
+                  #    Service listened on 80 and the Pod on 8000, this field
+                  #    would be 80.
+                  #
+                  # You may also write `port: {name: http}` to reference the
+                  # Service's port BY NAME, which is more robust to renumbering —
+                  # a good habit, and the reason to name Service ports at all.
+
+# ==============================================================================
+---
+# ==============================================================================
+# THE HTTPS-REDIRECT MIDDLEWARE (Traefik-specific)
+#
+# ⚠️ THIS IS A CRD — A CUSTOM RESOURCE DEFINITION. Worth pausing on, because it's
+#    the moment the "Kubernetes is an extensible API" idea becomes concrete rather
+#    than theoretical.
+#
+#    `Middleware` is NOT a Kubernetes object. It exists only because Traefik
+#    installed a CustomResourceDefinition that TAUGHT the API server a new kind.
+#    From then on, the API server validates, stores, and serves `Middleware`
+#    objects exactly like built-in ones — RBAC, kubectl, labels, watch, the lot.
+#
+#    THE PATTERN, which is most of the modern Kubernetes ecosystem:
+#        CRD (a new object type) + a CONTROLLER (a Pod watching it and acting)
+#        = an OPERATOR.
+#    Prometheus Operator, cert-manager, ArgoCD, Sealed Secrets, CloudNativePG:
+#    all the same shape. Understanding it means you can read any of them.
+#
+#    THE PRACTICAL CONSEQUENCE FOR THIS FILE: applying it to a cluster WITHOUT
+#    Traefik fails with `no matches for kind "Middleware"` — the API server has
+#    never heard of it. That is what "this manifest is not portable" means in
+#    concrete terms, and it's the cost of using a controller-specific feature.
+#    Weigh it consciously: here we accept it for one redirect, which is easy to
+#    replace. Building your whole routing layer on CRDs is a much bigger
+#    commitment to one controller.
+# ==============================================================================
+apiVersion: traefik.io/v1alpha1
+# ⚠️ `v1alpha1` is an ALPHA API version, and the version string tells you the
+#    stability contract:
+#      alpha — may change or vanish between releases; no upgrade guarantee.
+#      beta  — enabled by default, schema fairly stable, may still change.
+#      v1    — stable; breaking changes require a new version.
+#    An alpha CRD in your manifests is a thing to re-check on every controller
+#    upgrade. (Older Traefik used `traefik.containo.us/v1alpha1` — if this fails
+#    with "no matches for kind", the group name is the first thing to check
+#    against `kubectl api-resources | grep -i middleware`.)
+kind: Middleware
+metadata:
+  name: https-redirect
+  namespace: tasks-api
+  # Referenced from the annotation above as:
+  #     tasks-api-https-redirect@kubernetescrd
+  #     ^namespace ^name
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+    # `permanent: true` sends HTTP 301 rather than 302.
+    #
+    # ⚠️ A GENUINE FOOTGUN: browsers CACHE 301s aggressively and often
+    #    indefinitely. If you later need this hostname on plain HTTP, users who
+    #    ever received the 301 will keep being redirected to HTTPS from their own
+    #    cache, and no server-side change can undo it — they have to clear it
+    #    manually. Use 302 (permanent: false) while you're still experimenting,
+    #    and switch to 301 once you're certain. Being burned by this is a rite of
+    #    passage; skipping it is better.
+
+# ==============================================================================
+# VERIFYING IT — in the order that actually isolates a fault
+# ==============================================================================
+#   # 0. Is there a controller at all? If not, nothing below can work.
+#   kubectl get pods -n kube-system | grep traefik
+#   kubectl get ingressclass
+#
+#   # 1. Does the Ingress exist, and did a controller CLAIM it?
+#   kubectl get ingress -n tasks-api
+#   #   ⚠️ THE ADDRESS COLUMN IS THE TELL. Empty = no controller took ownership.
+#   #      Check ingressClassName against `kubectl get ingressclass`.
+#
+#   # 2. Did the controller find the backend?
+#   kubectl describe ingress tasks-api -n tasks-api
+#   #   ⚠️ Look for `<error: endpoints "tasks-api" not found>` in the Backends
+#   #      line. That means the SERVICE has no endpoints — so the bug is in
+#   #      41-service.yaml or in Pod readiness, NOT here. Diagnosing bottom-up
+#   #      (Pods -> endpoints -> Service -> Ingress) is much faster than guessing.
+#
+#   # 3. Bypass DNS entirely — proves routing without touching your hosts file:
+#   curl -k --resolve tasks.localdev:443:127.0.0.1 https://tasks.localdev/health
+#   #   -k accepts the self-signed certificate.
+#   #   --resolve fakes DNS for this one request only.
+#   #   If THIS works and the browser doesn't, the problem is DNS, not Kubernetes.
+#
+#   # 4. Confirm the redirect works:
+#   curl -I --resolve tasks.localdev:80:127.0.0.1 http://tasks.localdev/health
+#   #   Expect: HTTP/1.1 301 Moved Permanently + Location: https://...
+#
+#   # 5. Controller logs — where silently-ignored annotations and unresolvable
+#   #    middleware actually get reported:
+#   kubectl logs -n kube-system -l app.kubernetes.io/name=traefik --tail=50
+#
+# ── A DEBUGGING METHOD WORTH KEEPING ──────────────────────────────────────────
+#   When external access fails, test each layer inward. It costs four commands
+#   and it tells you exactly which layer is broken, instead of changing YAML
+#   hopefully:
+#
+#     1. The Pod:      kubectl exec -n tasks-api <pod> -- \
+#                        python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/health').status)"
+#     2. The Service:  kubectl run tmp --rm -it --restart=Never --image=curlimages/curl \
+#                        -n tasks-api -- curl -sS http://tasks-api:8000/health
+#     3. Port-forward: kubectl port-forward -n tasks-api svc/tasks-api 8000:8000
+#     4. The Ingress:  the curl --resolve command above
+#
+#   The FIRST step that fails is the layer with the bug. Everything outside it is
+#   innocent. This is the most useful habit in this entire repository — it turns
+#   "Kubernetes networking is a black box" into four checks.
+# ==============================================================================

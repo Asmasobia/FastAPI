@@ -1,0 +1,24 @@
+# ==============================================================================
+# .dockerignore — files EXCLUDED from the Docker "build context".
+#
+# WHY: when you run `docker build`, Docker sends the whole folder to the daemon.
+# Excluding junk (the venv, caches, the local DB, git history) makes builds
+# faster AND prevents secrets/local files from accidentally landing in the image.
+# Same spirit as .gitignore, but for image builds.
+# ==============================================================================
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.git/
+.gitignore
+*.db
+*.sqlite3
+.env
+.mypy_cache/
+.ruff_cache/
+tests/

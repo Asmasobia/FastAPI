@@ -1,0 +1,832 @@
+# ==============================================================================
+# 40-deployment.yaml — the application itself. The most important file here.
+#
+# WHAT A DEPLOYMENT ACTUALLY IS — the three-layer chain everyone gets asked about:
+#
+#     Deployment  ──manages──>  ReplicaSet  ──manages──>  Pods
+#
+#   Deployment: owns ROLLOUT STRATEGY and HISTORY. It does not create Pods.
+#   ReplicaSet: owns exactly one thing — "keep N Pods matching this label set
+#               alive". It has no concept of versions or updates.
+#   Pod:        one or more containers sharing a network namespace and lifetime.
+#
+#   WHY THREE LAYERS INSTEAD OF TWO: because a rollout is precisely the act of
+#   running two ReplicaSets side by side at different scales. On an update the
+#   Deployment creates a NEW ReplicaSet and shifts replicas from old to new,
+#   watching readiness as it goes. The old ReplicaSet is kept at 0 replicas
+#   rather than deleted — which is what makes `kubectl rollout undo` instant: it
+#   scales the old one back up. Nothing is rebuilt, nothing is re-pulled.
+#
+#   You can see the whole mechanism directly, and it's worth doing once:
+#       kubectl get rs -n tasks-api
+#       # after an image change, two ReplicaSets: old at 0, new at 3
+#
+#   If you can explain that paragraph, you can explain 80% of what interviews ask
+#   about Deployments.
+#
+# HOW THIS FILE GROWS ACROSS THE CURRICULUM:
+#   The version below is the FINISHED one. The modules build up to it, and the
+#   comments name which module justifies which block, so you can trace every
+#   field back to the problem it solves rather than treating it as boilerplate:
+#     Module 03 — replicas, selector, strategy, rollout and rollback
+#     Module 05 — envFrom (ConfigMap + Secret)
+#     Module 07 — probes (readiness now targets the app's /ready endpoint;
+#                 see src/routers/system.py and DECISIONS.md 001/002)
+#     Module 08 — resources and QoS
+#     Module 09 — terminationGracePeriodSeconds and the preStop hook
+#     Module 11 — anti-affinity
+# ==============================================================================
+
+apiVersion: apps/v1              # NOT v1. Deployments live in the `apps` group.
+                                 # Pods, Services, ConfigMaps, Secrets, and
+                                 # Namespaces are core (`v1`); anything that
+                                 # manages Pods is `apps/v1`; Jobs are `batch/v1`;
+                                 # HPA is `autoscaling/v2`. Getting this wrong
+                                 # gives you "no matches for kind", which reads
+                                 # like the kind doesn't exist rather than like a
+                                 # group typo.
+kind: Deployment
+
+metadata:
+  name: tasks-api
+  namespace: tasks-api
+  labels:
+    app: tasks-api
+    component: api               # Distinguishes these Pods from the migration
+                                 # Job's Pods, which share `app: tasks-api`.
+                                 # Lets `kubectl logs -l component=api` mean
+                                 # "the server", not "everything".
+
+spec:
+  # ---- replicas: DELIBERATELY ABSENT ----------------------------------------
+  #
+  # ⚠️ THE MOST IMPORTANT FIELD IN THIS FILE IS THE ONE THAT ISN'T HERE. There is
+  #    no `replicas:` line, and that is a decision, not an omission.
+  #
+  #    k8s/50-hpa.yaml owns the replica count now. If `replicas: 3` were still
+  #    here, TWO CONTROLLERS WOULD WANT THE SAME FIELD: every `kubectl apply`
+  #    would set it to 3, the HPA would notice the shortfall and set it to 5, and
+  #    the next apply — or a GitOps controller's next sync, which may be every
+  #    three minutes, forever — would knock it back to 3 and trigger a pointless
+  #    scale-down. Pods get created and destroyed in a cycle with no load change
+  #    to explain it, and it presents as a flapping application rather than as two
+  #    systems disagreeing. It is one of the most common real footguns in
+  #    Kubernetes and Module 10 covers it in full.
+  #
+  #    OMITTING THE FIELD MEANS "I DO NOT MANAGE THIS." Kubernetes defaults it to
+  #    1 at creation and then never touches it again, so the HPA is free to own it.
+  #    (The other legitimate answer is server-side apply with a distinct field
+  #    manager, or Argo CD `ignoreDifferences`. Removing the field is simpler and
+  #    reads as an intention.)
+  #
+  #    ⚠️ TWO PRACTICAL CONSEQUENCES:
+  #       - Applying this file WITHOUT 50-hpa.yaml gives you ONE replica. Apply the
+  #         HPA immediately after; the README's sequence does.
+  #       - The availability floor now lives in the HPA's `minReplicas`. That is
+  #         where to look for "how many replicas does this service run?"
+  #
+  # THE REASONING FOR THE NUMBER ITSELF still matters — it just applies to
+  # `minReplicas: 3` in 50-hpa.yaml now, and it is kept here because this is where
+  # anyone reading the Deployment will look for it:
+  #
+  # WHY 3 AND NOT 1 OR 2 — the reasoning matters more than the number:
+  #
+  #   1 replica  = no availability at all. Any Pod restart, node drain, or rollout
+  #                is downtime. Also hides every concurrency bug you have (see
+  #                30-migration-job.yaml for one it hid).
+  #   2 replicas = survives one failure, but during a rolling update or a node
+  #                drain you are momentarily at 1, i.e. back to no redundancy at
+  #                exactly the moment you're changing things.
+  #   3 replicas = you can lose one AND be mid-rollout and still have capacity.
+  #                It's also the minimum where a PodDisruptionBudget with
+  #                minAvailable: 2 is satisfiable (Module 11).
+  #
+  # 3 is the conventional floor for "available" stateless services for that
+  # reason, not out of superstition.
+  #
+  # ⚠️ ON A SINGLE-NODE CLUSTER, be honest about what you're getting: three
+  #    replicas on one node protects against PROCESS failure (a crash, an
+  #    OOMKill, a bad deploy) but not NODE failure. Real HA needs multiple nodes
+  #    in multiple failure domains. Claiming "highly available" for three Pods on
+  #    one machine is the kind of overstatement an interviewer will probe, and
+  #    naming the limitation yourself is much stronger than being caught by it.
+  #
+  # (Before the HPA existed, this file said `replicas: 3` right here. Keeping the
+  # history visible is deliberate: the interesting part of a manifest is often the
+  # field that used to be in it.)
+  #
+  # replicas: 3        <- removed; see the block above and k8s/50-hpa.yaml
+
+  # ---- selector: IMMUTABLE. Get it right the first time. --------------------
+  # This is how the Deployment finds the Pods it owns. It must match
+  # spec.template.metadata.labels, and the API server rejects the object if it
+  # doesn't (a Deployment unable to count its own Pods is meaningless).
+  #
+  # ⚠️ THIS FIELD CANNOT BE CHANGED AFTER CREATION. To change it you must delete
+  #    and recreate the Deployment, which means downtime. So:
+  #      • Use a SMALL, STABLE set of labels here.
+  #      • NEVER include anything that changes per release — no `version`, no
+  #        git SHA, no `app.kubernetes.io/version`. Those belong in
+  #        metadata.labels, where they're free to change.
+  #
+  # We match on two labels (app + component) rather than one, so the Deployment
+  # cannot accidentally adopt the migration Job's Pods, which also carry
+  # `app: tasks-api`. Overlapping selectors between controllers cause genuinely
+  # baffling behaviour — two controllers fighting over the same Pods, each
+  # deleting the other's "extras".
+  selector:
+    matchLabels:
+      app: tasks-api
+      component: api
+
+  # ---- Rollout strategy ----------------------------------------------------
+  strategy:
+    type: RollingUpdate
+    # The alternative is Recreate: kill everything, then start the new version.
+    # Simple, and correct for a single-writer workload with a ReadWriteOnce
+    # volume (see 21-redis.yaml for why RollingUpdate DEADLOCKS in that case) —
+    # but it means guaranteed downtime, which is exactly what we're avoiding.
+    rollingUpdate:
+      # maxSurge: how many Pods ABOVE `replicas` may exist during the rollout.
+      # 1 means the rollout goes 3 -> 4 -> 3, one new Pod at a time.
+      #   Higher = faster rollout, more peak resource use. `maxSurge: 3` here
+      #   would double capacity briefly, which needs a node that can take it.
+      maxSurge: 1
+
+      # maxUnavailable: how many Pods below `replicas` may be unavailable.
+      #
+      # ⚠️ 0 IS THE SINGLE MOST IMPORTANT VALUE IN THIS FILE.
+      #
+      #   The DEFAULT is 25%, which at 3 replicas rounds to 1. That means during
+      #   every deploy you knowingly run at 2/3 capacity. If your normal load
+      #   needs all three, every deploy is a partial brownout — elevated latency
+      #   and timeouts that people learn to describe as "it's always a bit slow
+      #   when we deploy" instead of treating as a bug.
+      #
+      #   0 means: START a new Pod, WAIT for it to pass its readiness probe, and
+      #   only THEN terminate an old one. Full capacity throughout.
+      #
+      #   THE COST, stated honestly: the rollout is slower (strictly sequential),
+      #   and it requires maxSurge >= 1 — `maxSurge: 0` with `maxUnavailable: 0`
+      #   is rejected, because it describes a rollout that cannot move.
+      #
+      #   ⚠️ AND THE CATCH: maxUnavailable: 0 only delivers zero-downtime if your
+      #   readiness probe is HONEST. If readiness returns 200 before the app can
+      #   actually serve (no dependency checks, or too short an initial delay),
+      #   Kubernetes shifts traffic to a Pod that will fail it, and you get a
+      #   zero-downtime deploy that drops requests. maxUnavailable: 0 and a good
+      #   readiness probe are one feature in two places — see Module 07.
+      maxUnavailable: 0
+
+  # ---- revisionHistoryLimit -------------------------------------------------
+  # How many old ReplicaSets to retain for rollback. Default is 10.
+  #
+  # Each retained ReplicaSet is a scaled-to-zero object, so the cost is etcd
+  # entries and `kubectl get rs` clutter, not compute. 5 is plenty — if you need
+  # to roll back more than five versions, the problem is not reachable by
+  # rollback.
+  #
+  # ⚠️ SETTING THIS TO 0 DISABLES ROLLBACK ENTIRELY. `kubectl rollout undo` will
+  #    report no revision to roll back to. People set it to 0 to "keep things
+  #    clean" and discover the consequence during an incident.
+  revisionHistoryLimit: 5
+
+  # ---- progressDeadlineSeconds ---------------------------------------------
+  # If the rollout makes no progress for this long, mark the Deployment as failed
+  # with reason `ProgressDeadlineExceeded`. Default 600s (10 minutes).
+  #
+  # WHY SHORTEN IT TO 120: without a short deadline, a broken image or a probe
+  # that never passes leaves `kubectl rollout status` hanging for ten minutes
+  # before telling you anything. In CI that's ten minutes of a pipeline pretending
+  # to work. 120s is long enough for an image pull plus startup on a slow machine
+  # and short enough to fail fast.
+  #
+  # ⚠️ IMPORTANT: exceeding the deadline does NOT auto-rollback. Kubernetes only
+  #    reports failure; the old Pods keep serving (thanks to maxUnavailable: 0)
+  #    and the new ones stay broken. Automatic rollback is your pipeline's job:
+  #        kubectl rollout status deployment/tasks-api -n tasks-api --timeout=130s \
+  #          || kubectl rollout undo deployment/tasks-api -n tasks-api
+  #    That two-line pattern is worth carrying into every project you deploy.
+  progressDeadlineSeconds: 120
+
+  # ============================================================================
+  # THE POD TEMPLATE
+  #
+  # Everything below describes the Pods to create. The crucial mechanical fact:
+  # ANY change inside `template` produces a new PodTemplate hash, which creates a
+  # NEW ReplicaSet, which triggers a rollout. Changes OUTSIDE it (replicas,
+  # strategy, revisionHistoryLimit) do not restart anything.
+  #
+  # That's why `kubectl rollout restart` works the way it does: it doesn't have a
+  # special API: it just stamps a timestamp annotation onto this template, which
+  # changes the hash, which starts a rollout. Knowing that demystifies both the
+  # command and the "why didn't my ConfigMap change restart anything" question —
+  # editing a ConfigMap doesn't touch this template, so nothing rolls.
+  # ============================================================================
+  template:
+    metadata:
+      labels:
+        # MUST be a superset of spec.selector.matchLabels.
+        app: tasks-api
+        component: api
+
+      # annotations:
+      #   HOW REAL PROJECTS AUTO-RESTART ON CONFIG CHANGE. A Helm chart writes:
+      #     checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      #   The annotation value changes when the ConfigMap changes -> template hash
+      #   changes -> rollout happens automatically. Can't be done by hand in
+      #   static YAML (you'd be pasting hashes), which is a concrete, honest
+      #   reason to adopt Helm or Kustomize rather than "everyone uses it".
+      #   The alternative is the Reloader controller, which watches ConfigMaps and
+      #   Secrets and triggers rollouts for you.
+
+    spec:
+      # ---- Graceful shutdown (Module 09 explains this properly) -------------
+      # How long Kubernetes waits after SIGTERM before sending SIGKILL.
+      # Default is 30s. This must exceed preStop sleep + your longest request.
+      terminationGracePeriodSeconds: 45
+
+      # ---- Pod-level security context --------------------------------------
+      # Applies to every container unless a container overrides it. Setting it
+      # here rather than only per-container means a container added later
+      # inherits the hardening by default — secure-by-default beats
+      # secure-if-remembered.
+      securityContext:
+        runAsNonRoot: true          # The kubelet REFUSES to start the Pod if the
+                                    # image's user resolves to uid 0. That's the
+                                    # point: it fails loudly at admission instead
+                                    # of quietly running as root.
+        runAsUser: 1000             # Matches `useradd --uid 1000 appuser` in the
+                                    # Dockerfile. Stated here as well as in the
+                                    # image so the manifest doesn't silently
+                                    # depend on an image detail — if someone
+                                    # rebuilds the image with a different uid,
+                                    # this fails visibly rather than running as
+                                    # an unexpected user.
+        runAsGroup: 1000
+        fsGroup: 1000               # Group ownership applied to mounted volumes.
+                                    # Only matters for the /tmp emptyDir here,
+                                    # but harmless and correct.
+        seccompProfile:
+          type: RuntimeDefault      # Applies the container runtime's default
+                                    # seccomp filter, blocking ~44 rarely-needed
+                                    # syscalls (including several used in known
+                                    # container escapes). Effectively free, and
+                                    # required by the Pod Security Standards
+                                    # "restricted" profile — which is what a
+                                    # hardened cluster will enforce, so meeting
+                                    # it now means your manifests don't get
+                                    # rejected later.
+
+      containers:
+        - name: api
+
+          # ---- The image ---------------------------------------------------
+          # An EXPLICIT VERSION TAG, never `:latest`. Three reasons, and the third
+          # is the one people miss:
+          #   1. `:latest` is not a version. You cannot tell what's running, and
+          #      "what changed?" becomes unanswerable during an incident.
+          #   2. Different nodes can cache different builds of the same tag, so
+          #      your replicas silently run different code. Debugging that is
+          #      genuinely awful — half your requests behave differently.
+          #   3. Rollback is impossible. `rollout undo` restores the old Pod
+          #      template, which says `:latest` — the same tag that's broken.
+          #
+          # Production practice: tag with an immutable identifier (git SHA, or a
+          # semver you never reuse), or pin a digest (@sha256:...) for absolute
+          # certainty.
+          image: tasks-api:0.1.0
+
+          # ⚠️ THE MOST COMMON BEGINNER FAILURE IN THE WHOLE PROJECT.
+          #
+          #   This image is built locally and lives in NO registry. The default
+          #   pull policy for a tagged (non-`latest`) image is IfNotPresent, so
+          #   this is technically redundant — but write it anyway, because:
+          #
+          #     • For `:latest`, Kubernetes SPECIAL-CASES the default to Always,
+          #       which then tries Docker Hub and gives you ImagePullBackOff.
+          #       Relying on a default that changes based on your tag is a trap.
+          #     • It documents "this image is local" for the next reader.
+          #
+          #   AND — the part that actually catches people on Rancher Desktop —
+          #   the image must be in the CLUSTER's image store, not just your
+          #   Docker daemon. `docker images` listing it proves nothing about what
+          #   k3s can see. See k8s/README.md for the correct build command.
+          #   Symptom if you get this wrong: ErrImageNeverPull or
+          #   ImagePullBackOff, and `kubectl describe pod` says so explicitly.
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http           # NAMING THIS MATTERS: the Service and the
+                                   # probes can reference `http` instead of 8000.
+                                   # Change the port later and you edit one place.
+              containerPort: 8000  # Matches EXPOSE 8000 and uvicorn's --port in
+                                   # the Dockerfile CMD. Documentation only — it
+                                   # opens nothing — but Services resolve named
+                                   # targetPorts through it, so it isn't inert.
+              protocol: TCP
+
+          # ---- NO command / args, DELIBERATELY -------------------------------
+          # The Dockerfile's CMD already runs:
+          #     uvicorn src.main:app --host 0.0.0.0 --port 8000
+          #
+          # Omitting command/args here is a POSITIVE DECISION, not laziness:
+          #
+          #   1. It does NOT run migrations. docker-compose chains
+          #      `alembic upgrade head && uvicorn ...`, which would run three
+          #      concurrent migrations at 3 replicas — the exact bug
+          #      30-migration-job.yaml exists to fix. Leaving CMD alone keeps the
+          #      fix intact.
+          #   2. `--host 0.0.0.0` is essential and easy to get wrong. Binding to
+          #      127.0.0.1 means the process only accepts connections from inside
+          #      its OWN network namespace, so kube-proxy cannot reach it and
+          #      every Service connection is refused. The Pod looks perfectly
+          #      healthy. This is the second most common "my Service doesn't
+          #      work" cause after selector typos.
+          #   3. One definition of how the app starts, in the Dockerfile, so
+          #      `docker run` and Kubernetes behave identically. Overriding here
+          #      creates a divergence between local and cluster behaviour that
+          #      nobody documents.
+          #
+          # ⚠️ IF YOU DO OVERRIDE: `command` replaces ENTRYPOINT, `args` replaces
+          #    CMD. Setting only `command` DISCARDS the Dockerfile's CMD, which
+          #    is how people accidentally run a binary with no arguments and get
+          #    a confusing usage message.
+
+          # ---- Configuration (Module 05) -------------------------------------
+          # Bulk-import every key from the ConfigMap and the Secret as env vars.
+          # pydantic-settings in src/config.py matches them case-insensitively.
+          envFrom:
+            - configMapRef:
+                name: tasks-api-config
+            - secretRef:
+                name: tasks-api-secrets
+          # ⚠️ TWO THINGS TO KNOW:
+          #  1. If either object is MISSING, the Pod does not crash with a clear
+          #     message — it sits in CreateContainerConfigError and never starts.
+          #     `kubectl get pods` shows the state; `kubectl describe pod` names
+          #     the missing object. Add `optional: true` to tolerate absence,
+          #     which is right for feature-flag ConfigMaps and wrong for
+          #     credentials.
+          #  2. On a KEY COLLISION, later sources win and an explicit `env:` entry
+          #     beats all of `envFrom`. Nothing warns you. The ConfigMap
+          #     deliberately omits DATABASE_URL so there is no collision here.
+
+          # Example of adding one extra var alongside envFrom — the Downward API,
+          # which injects facts about the Pod itself. Useful in logs when you have
+          # many replicas: "which Pod produced this line?" becomes answerable.
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Other commonly useful fields: metadata.namespace, status.podIP,
+            # spec.nodeName. `resourceFieldRef` can inject the container's own
+            # memory limit — which is how you'd correctly size a JVM heap or a
+            # worker pool from inside the container instead of guessing.
+
+          # ==========================================================================
+          # PROBES (Module 07 covers these in full)
+          # ==========================================================================
+          # THE ONE-LINE DISTINCTION, which is asked constantly:
+          #   startup   — "has it finished booting?"   Pauses the other two.
+          #   readiness — "should it receive traffic?" Failing REMOVES it from the
+          #                Service endpoints. Does NOT restart it.
+          #   liveness  — "is it wedged?"              Failing RESTARTS the
+          #                container.
+          # --------------------------------------------------------------------------
+
+          # ---- startupProbe ----------------------------------------------------
+          # WHY IT EXISTS AT ALL, since it looks redundant with readiness:
+          #   Before startupProbe, slow-starting apps forced you to set a long
+          #   initialDelaySeconds on the LIVENESS probe. But that delay applies
+          #   forever — so a container that later wedges takes that same long
+          #   delay before being restarted. You had to choose between "tolerates
+          #   slow startup" and "recovers quickly from a hang".
+          #
+          #   startupProbe separates them. While it is failing, liveness and
+          #   readiness are SUSPENDED entirely. Once it succeeds once, it never
+          #   runs again and the other two take over with tight timings.
+          #
+          # BUDGET: failureThreshold x periodSeconds = 30 x 2 = 60 seconds to
+          # start. Exceed it and the container is killed and restarted.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http           # By NAME, not 8000. Change the port in one
+                                   # place (`ports:` above) and probes follow.
+            periodSeconds: 2
+            failureThreshold: 30
+            timeoutSeconds: 2
+
+          # ---- readinessProbe --------------------------------------------------
+          # Controls SERVICE MEMBERSHIP. Fails -> the Pod's IP is removed from the
+          # Endpoints/EndpointSlice, so kube-proxy stops sending it new
+          # connections. The container keeps running untouched.
+          #
+          # THIS IS THE PROBE THAT MAKES ZERO-DOWNTIME DEPLOYS WORK. With
+          # maxUnavailable: 0, the Deployment waits for THIS to pass before
+          # terminating an old Pod. A dishonest readiness probe silently converts
+          # your zero-downtime rollout into dropped requests.
+          #
+          # ⚠️ THIS POINTS AT /ready, NOT /health, AND THE DIFFERENCE IS THE WHOLE
+          #    POINT. (It pointed at /health until the application grew a real
+          #    readiness endpoint — deliberately, with a comment saying so. See
+          #    src/routers/system.py for the endpoint and its reasoning.)
+          #
+          #    /health is a LIVENESS-style check: it reports that the process is up
+          #    and checks nothing external. Point READINESS at it and a Pod whose
+          #    database connection pool is dead still reports ready, stays in the
+          #    Service, and returns 500s to real users. The probe passes while the
+          #    application is useless — the worst kind of green.
+          #
+          #    /ready runs a bounded `SELECT 1` through the app's OWN connection
+          #    pool (not a fresh connection — otherwise it would report "database
+          #    reachable" while the pool is exhausted and every real request times
+          #    out) and returns 503 on failure.
+          #
+          #    Redis is checked too but is NOT fatal: the cache degrades gracefully
+          #    in code, and all replicas share one Redis — so making it fatal would
+          #    fail readiness on EVERY replica simultaneously during a Redis blip,
+          #    empty the endpoint list, and turn "slower" into "down". Readiness is
+          #    a good tool for per-instance faults and a dangerous one for faults
+          #    every instance shares.
+          #
+          #    ⚠️ THE PROBE AND THE APP MUST AGREE ABOUT TIMEOUTS.
+          #       timeoutSeconds here is 3s; the app's READINESS_TIMEOUT_SECONDS is
+          #       2s, deliberately lower. Reversed, kubelet would abandon its
+          #       request while the handler kept waiting on the database, still
+          #       holding a pool connection — one leaked connection every 5 seconds
+          #       until the pool is empty, at which point the health check has
+          #       caused the outage it existed to report.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3      # Must EXCEED the app's own 2s internal budget,
+                                   # so the app emits a diagnostic 503 saying which
+                                   # check failed, instead of kubelet recording a
+                                   # bare "probe timed out" that names nothing.
+            successThreshold: 1
+            failureThreshold: 3    # ~15s of failure before removal from the
+                                   # Service. Tight, because leaving a broken Pod
+                                   # in rotation costs real user errors.
+            # NOTE: no initialDelaySeconds. The startupProbe already handles the
+            # boot window, so a delay here would be redundant — and it would slow
+            # every rollout by that amount for no benefit.
+
+          # ---- livenessProbe --------------------------------------------------
+          # Fails -> the container is KILLED and restarted (Pod stays, restart
+          # count increments). This is a blunt instrument. Use it only for
+          # UNRECOVERABLE states: a deadlocked event loop, an exhausted thread
+          # pool, a wedged process.
+          #
+          # ⚠️ THE CLASSIC OUTAGE, worth memorising because it's the most-asked
+          #    probe question and the most common real-world probe mistake:
+          #
+          #    Someone makes the liveness probe check the DATABASE. The database
+          #    then has a brief hiccup. Every replica's liveness probe fails
+          #    simultaneously, so Kubernetes restarts EVERY replica at once. The
+          #    restarts open a flood of new connections to a database that is
+          #    already struggling, which keeps it struggling, which fails the
+          #    probes again. You have converted a 10-second database blip into a
+          #    total, self-sustaining outage — and the cluster is doing it to you
+          #    enthusiastically.
+          #
+          #    THE RULE: liveness checks ONLY the process itself. Never a
+          #    dependency. Dependency health belongs in READINESS, where the
+          #    consequence is "stop sending traffic" (which is correct and
+          #    reversible) rather than "restart everything" (which is not).
+          #
+          #    Deliberately laxer than readiness — longer period, same threshold
+          #    but slower cadence. Restarting is expensive; removal from a Service
+          #    is cheap and self-healing. Match probe aggressiveness to the cost
+          #    of the action it triggers.
+          livenessProbe:
+            httpGet:
+              path: /health        # STAYS /health, now that /ready exists — and
+                                   # that is the entire point of having two
+                                   # endpoints. /health checks nothing external;
+                                   # /ready checks the database. Pointing THIS
+                                   # probe at /ready would restart every replica
+                                   # simultaneously on a database hiccup, which is
+                                   # the outage described above.
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3    # ~30s wedged before a restart.
+
+          # ==========================================================================
+          # RESOURCES (Module 08)
+          # ==========================================================================
+          # THE TWO FACTS EVERYTHING ELSE FOLLOWS FROM:
+          #
+          #  1. REQUESTS are for the SCHEDULER. It sums requests on each node and
+          #     places the Pod where they fit. Requests are a RESERVATION —
+          #     unused reserved capacity is wasted; nobody else can have it.
+          #     Requests also set the CPU shares the container gets under
+          #     contention.
+          #
+          #  2. LIMITS are enforced at RUNTIME by the kernel, and the two
+          #     resources behave completely differently:
+          #
+          #       CPU is COMPRESSIBLE. Exceed the limit and you are THROTTLED —
+          #         the cgroup gets no CPU for the rest of its 100ms period. Slow,
+          #         still alive. The symptom is p99 latency, and it is invisible
+          #         unless you look at container_cpu_cfs_throttled_seconds_total.
+          #         Many teams chase mystery latency for weeks; it's throttling.
+          #
+          #       MEMORY is INCOMPRESSIBLE. Exceed the limit and the kernel OOM
+          #         killer terminates the process instantly. Exit code 137
+          #         (128 + SIGKILL 9). No cleanup, no graceful shutdown, no chance
+          #         to log anything. `kubectl describe pod` shows
+          #         `Last State: Terminated, Reason: OOMKilled`.
+          #
+          # WHERE THE NUMBERS BELOW CAME FROM — and the honest answer matters:
+          #   They are a STARTING ESTIMATE, not a measurement. That's the correct
+          #   way to begin (you cannot measure what isn't running) but it is NOT
+          #   where you should stop. Module 08 has you measure real usage with
+          #   `kubectl top pods` under load and tighten these. Guessed limits are
+          #   how you end up with either OOMKills in production or a cluster
+          #   that's 20% utilised and "full".
+          #
+          # QoS CLASS — a direct consequence of what you write here, and it
+          # decides who dies when a NODE runs out of memory:
+          #   Guaranteed — requests == limits for every resource. Evicted LAST.
+          #   Burstable  — requests < limits (what we have). Evicted in the middle.
+          #   BestEffort — nothing set at all. Evicted FIRST. Never do this for
+          #                anything you care about: a BestEffort Pod can also be
+          #                scheduled onto a node with no room to run, because it
+          #                told the scheduler it needs nothing.
+          #
+          # WHY WE CHOSE BURSTABLE RATHER THAN GUARANTEED:
+          #   A web API has bursty CPU. Burstable lets it use idle node capacity
+          #   during spikes instead of being throttled at its request. Guaranteed
+          #   would mean reserving peak capacity permanently — better latency
+          #   predictability, worse density and cost. Guaranteed is the right call
+          #   for latency-critical or CPU-pinned workloads; Burstable is right
+          #   here. Either is defensible; not knowing which you have is not.
+          resources:
+            requests:
+              memory: "128Mi"      # Python + FastAPI + SQLAlchemy baseline.
+              cpu: "100m"          # 0.1 core. Idle serving needs very little.
+            limits:
+              memory: "512Mi"      # 4x the request. Room for connection pools and
+                                   # request buffers without inviting a leak to
+                                   # eat the node.
+              cpu: "1000m"         # 1 full core.
+                                   #
+                                   # ⚠️ A CPU LIMIT ON A PYTHON APP IS LESS
+                                   # DANGEROUS THAN ON A THREADED RUNTIME, BUT
+                                   # STILL WORTH THINKING ABOUT. CPU limits are
+                                   # enforced per 100ms period across ALL threads
+                                   # combined, so a multi-threaded process can
+                                   # burn its whole quota in 20ms and then stall
+                                   # for 80. uvicorn with one worker is
+                                   # single-threaded async, so it's mostly
+                                   # immune — but add `--workers 4` and this limit
+                                   # becomes a hard ceiling shared by all four.
+                                   #
+                                   # Some serious operators omit CPU limits
+                                   # entirely (keeping requests) precisely to
+                                   # avoid throttling, relying on requests for
+                                   # fair sharing. That's a legitimate position
+                                   # with a real cost: one runaway Pod can starve
+                                   # its neighbours. Know that the debate exists.
+
+          # ==========================================================================
+          # GRACEFUL SHUTDOWN (Module 09)
+          # ==========================================================================
+          # THE PROBLEM, which is genuinely non-obvious and bites everyone:
+          #
+          #   When a Pod is deleted, TWO things happen CONCURRENTLY, not in order:
+          #     (a) the Pod is removed from the Service's EndpointSlice, and
+          #     (b) the container receives SIGTERM.
+          #
+          #   But (a) has to PROPAGATE: endpoints controller -> EndpointSlice ->
+          #   every node's kube-proxy -> iptables/IPVS rules rewritten. That takes
+          #   hundreds of milliseconds to a few seconds. Meanwhile the app got
+          #   SIGTERM immediately and uvicorn stops accepting new connections at
+          #   once.
+          #
+          #   Result: for that propagation window, kube-proxy is still routing new
+          #   connections to a Pod that has stopped accepting them. Those requests
+          #   fail — connection refused. Every deploy drops a handful of requests,
+          #   and because it's a handful, it gets written off as noise.
+          #
+          # THE FIX — and it is counter-intuitive enough to be worth stating
+          # plainly: SLEEP. Do nothing at all for a few seconds.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+              # The preStop hook runs BEFORE SIGTERM is sent, and Kubernetes waits
+              # for it to finish. So the sequence becomes:
+              #
+              #   1. Pod marked Terminating; endpoint removal STARTS.
+              #   2. preStop runs: sleep 5. The app is still fully serving — it
+              #      hasn't been signalled yet.
+              #   3. During those 5s, kube-proxy rules update everywhere. New
+              #      connections stop arriving naturally.
+              #   4. preStop finishes. NOW SIGTERM is sent.
+              #   5. uvicorn drains in-flight requests and exits cleanly.
+              #
+              # Zero dropped requests, achieved by deliberately doing nothing at
+              # the right moment.
+              #
+              # ⚠️ `sleep` MUST EXIST IN THE IMAGE. python:3.12-slim is
+              #    Debian-based, so /bin/sleep is there. On a `distroless` or
+              #    `scratch` image there is no shell and no coreutils, so this
+              #    hook fails silently — the hook error is only visible in Pod
+              #    events, and you get the dropped requests back with no obvious
+              #    cause. Alternatives for those images: Kubernetes 1.30+ has a
+              #    native `sleep` preStop hook type, or handle the delay inside
+              #    the app's SIGTERM handler.
+              #
+              # ⚠️ THE BUDGET MUST ADD UP:
+              #      terminationGracePeriodSeconds (45)
+              #        >= preStop (5) + longest in-flight request (~30) + margin
+              #    If preStop alone exceeds the grace period, SIGKILL arrives
+              #    during the sleep and you get the WORST outcome: no drain AND no
+              #    graceful shutdown. Doing this arithmetic is the whole skill.
+
+          # ==========================================================================
+          # CONTAINER-LEVEL SECURITY CONTEXT
+          # ==========================================================================
+          # The Pod-level context above sets the user; these are container-scoped.
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Sets no_new_privs. Blocks setuid binaries from elevating — a
+            # standard step in container escape chains. Essentially never breaks a
+            # normal application.
+
+            capabilities:
+              drop: ["ALL"]
+              # Linux capabilities are root's powers split into ~40 pieces
+              # (CAP_NET_BIND_SERVICE, CAP_CHOWN, CAP_SYS_ADMIN...). Container
+              # runtimes grant about 14 by default. This app needs NONE:
+              # port 8000 is above 1024, so it doesn't even need
+              # NET_BIND_SERVICE — which is, incidentally, the real reason to
+              # listen on 8000 instead of 80 inside a container.
+
+            readOnlyRootFilesystem: true
+            # Mounts the container's filesystem read-only. Strong defence: an
+            # attacker with code execution cannot drop a binary, modify your code,
+            # or install a persistence mechanism.
+            #
+            # ⚠️ VERIFY THIS RATHER THAN TRUSTING IT, and be ready to remove it.
+            #    It is the hardening flag most likely to break a container, and
+            #    the error is usually an opaque "Read-only file system" from deep
+            #    inside a library. It works here because:
+            #      • PYTHONDONTWRITEBYTECODE=1 in the Dockerfile stops Python
+            #        writing __pycache__ next to the source. Without that env var
+            #        this flag alone would break startup — a nice example of an
+            #        image decision enabling a cluster decision.
+            #      • The app writes no files; it writes to Postgres and Redis.
+            #      • /tmp is provided as a writable emptyDir below.
+            #
+            #    If the container won't start after enabling this, remove it FIRST
+            #    to confirm the cause — then put it back and mount an emptyDir at
+            #    whatever path needed writing. Leaving it off permanently is the
+            #    lazy fix.
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+              # WHY THIS IS NEEDED at all with readOnlyRootFilesystem: true —
+              # Python's tempfile, some libraries' scratch space, and matplotlib-
+              # style cache directories all assume a writable /tmp. Giving them an
+              # emptyDir is the correct pattern: writable exactly where needed,
+              # read-only everywhere else. Blanket-disabling the flag to fix one
+              # path throws away the protection for the whole filesystem.
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory         # tmpfs — RAM-backed, so it's fast and nothing
+                                   # touches node disk (no leftover temp files
+                                   # after a crash).
+            sizeLimit: 64Mi
+            # ⚠️ WITH medium: Memory, THIS SPACE COUNTS AGAINST THE CONTAINER'S
+            #    MEMORY LIMIT. So the app's effective memory budget is 512Mi minus
+            #    whatever is sitting in /tmp. Fill /tmp with 500Mi and you get
+            #    OOMKilled — and it looks like an application memory leak, because
+            #    nothing points at the volume. sizeLimit caps the damage: writes
+            #    beyond it fail with ENOSPC (a clear error) instead of silently
+            #    consuming the memory budget (a confusing one). Prefer the clear
+            #    failure.
+            #
+            #    Omit `medium: Memory` for disk-backed scratch instead, which is
+            #    right when the data is large and the memory limit is tight.
+
+      # ==========================================================================
+      # SPREADING REPLICAS ACROSS NODES (Module 11)
+      # ==========================================================================
+      # THE PROBLEM: nothing so far stops the scheduler putting all 3 replicas on
+      # ONE node. If it does — and it often will, because the scheduler's default
+      # scoring mildly favours packing — then losing that node loses all 3 Pods,
+      # and your "3 replicas for availability" bought you nothing.
+      affinity:
+        podAntiAffinity:
+          # `preferred` (soft) rather than `required` (hard). THE DECISION:
+          #
+          #   requiredDuringSchedulingIgnoredDuringExecution — a HARD rule. On a
+          #     single-node cluster, 2 of the 3 Pods would sit in Pending
+          #     FOREVER, because the rule can never be satisfied. `kubectl
+          #     describe pod` would say "didn't match pod anti-affinity rules".
+          #     Your app would be permanently degraded in the name of
+          #     availability.
+          #
+          #   preferredDuringSchedulingIgnoredDuringExecution — a SOFT preference.
+          #     The scheduler tries to spread; if it can't, it schedules anyway.
+          #     On one node: all 3 Pods run (correct for dev). On three nodes: they
+          #     spread (correct for prod). The SAME manifest does the right thing
+          #     in both places, which is the property you want.
+          #
+          # "IgnoredDuringExecution" in both names means: this is evaluated at
+          # SCHEDULING time only. Already-running Pods are never moved to satisfy
+          # it later. Kubernetes does not rebalance on its own — a fact that
+          # surprises people when they add a node and nothing migrates to it.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100          # 1-100. With several preferences, the scheduler
+                                   # sums weights per candidate node and picks the
+                                   # highest. 100 = "this is the one I care about".
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: tasks-api
+                    component: api
+                    # Read this as: "prefer NOT to be placed near Pods matching
+                    # these labels" — i.e. near my own siblings.
+                topologyKey: kubernetes.io/hostname
+                # topologyKey defines what "near" MEANS, and choosing it is the
+                # actual engineering decision:
+                #   kubernetes.io/hostname            -> spread across NODES
+                #   topology.kubernetes.io/zone       -> spread across AVAILABILITY
+                #                                        ZONES (survives a whole
+                #                                        AZ failure — what you
+                #                                        want in the cloud)
+                #   topology.kubernetes.io/region     -> across regions
+                #
+                # Spreading across nodes protects against node failure. Spreading
+                # across zones protects against datacentre failure. They are
+                # different guarantees at different costs (cross-zone traffic is
+                # billed), and picking the right one is a cost/risk decision, not
+                # a default.
+      #
+      # ⚠️ WORTH KNOWING: `topologySpreadConstraints` is the MODERN replacement
+      #    for this pattern and is better in a specific way — it lets you express
+      #    "no node may have more than 1 more replica than any other"
+      #    (maxSkew: 1), which anti-affinity cannot say. Anti-affinity is
+      #    all-or-nothing per topology domain. topologySpreadConstraints is
+      #    preferred for new work; anti-affinity is shown here because it is what
+      #    you'll meet in existing manifests, and because the concept of a
+      #    topologyKey transfers directly to both.
+
+      # ==========================================================================
+      # THE MODERN FORM, left commented ON PURPOSE (Module 11)
+      # ==========================================================================
+      # This is what the block above would look like as a topologySpreadConstraint,
+      # and it is what to write for new work in a real multi-zone cluster:
+      #
+      # topologySpreadConstraints:
+      #   - maxSkew: 1
+      #     topologyKey: topology.kubernetes.io/zone
+      #     whenUnsatisfiable: DoNotSchedule
+      #     labelSelector:
+      #       matchLabels:
+      #         app: tasks-api
+      #         component: api
+      #
+      # WHY IT IS BETTER, precisely: podAntiAffinity is BINARY per topology domain —
+      # "never together" or "prefer apart". It cannot express "roughly evenly", so
+      # at 10 replicas across 3 nodes `required` is unsatisfiable and `preferred`
+      # guarantees nothing. `maxSkew` is a NUMBER, so it says the thing you actually
+      # mean. It also scales better: anti-affinity makes the scheduler compare each
+      # candidate Pod against every existing one, and that is a well-documented
+      # scheduling bottleneck in large clusters.
+      #
+      # ⚠️ WHY IT IS NOT ACTIVE HERE — two honest reasons, not laziness:
+      #    1. A single-node cluster has exactly one topology domain, so any spread
+      #       constraint is trivially satisfied and proves nothing. With
+      #       `whenUnsatisfiable: DoNotSchedule` on `hostname` instead of `zone`, it
+      #       would be worse than useless: 2 of 3 Pods Pending forever, the same
+      #       failure as hard anti-affinity.
+      #    2. Running both mechanisms at once means two independent placement
+      #       systems with overlapping intent — harder to reason about than either
+      #       alone, and the first thing to untangle when placement misbehaves.
+      #
+      # Fields worth knowing exist before you need them:
+      #   minDomains         - "assume at least N domains", so 3 replicas in 1 zone
+      #                        is not counted as perfectly spread (1.27+).
+      #   nodeAffinityPolicy / nodeTaintsPolicy - whether nodes this Pod could never
+      #                        land on count as domains at all. Excluding tainted
+      #                        nodes is usually what you meant (1.26+).
+      #
+      # ⚠️ AND THE LIMIT THAT APPLIES TO BOTH MECHANISMS: the "IgnoredDuringExecution"
+      #    property means placement is decided ONCE, at scheduling time. Nothing
+      #    rebalances later. After a node failure and recovery, or a drain that
+      #    packed everything onto one box, your careful spread is simply gone and no
+      #    controller will restore it. Rebalancing is the `descheduler` project's
+      #    job, and it is not installed by default anywhere.

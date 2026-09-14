@@ -1,0 +1,210 @@
+# ==============================================================================
+# 10-configmap.yaml — non-secret configuration for the application.
+#
+# WHY THIS EXISTS AT ALL:
+#   The twelve-factor principle: configuration that varies between deployments
+#   lives in the ENVIRONMENT, not in the image. The same `tasks-api:0.1.0` image
+#   must run in dev, staging, and production — only the surrounding config
+#   changes. If you rebuild the image to change a setting, the thing you tested
+#   is not the thing you shipped.
+#
+# HOW THE APP CONSUMES THIS:
+#   src/config.py defines a pydantic-settings `Settings` class. pydantic-settings
+#   matches environment variables to fields CASE-INSENSITIVELY, so the env var
+#   DATABASE_URL fills the field `database_url`. Its resolution order is:
+#
+#       real environment variables  >  .env file  >  class defaults
+#
+#   Environment variables win, which is exactly what we need — the container has
+#   no .env file, so these values take effect, and every field has a sane default
+#   so a missing key degrades rather than crashes.
+#
+#   40-deployment.yaml pulls all of these in at once with `envFrom.configMapRef`,
+#   rather than listing each key individually. Trade-off:
+#     envFrom  — add a key here and it appears in the Pod with no Deployment edit.
+#                Concise. But you can't tell from the Deployment which env vars
+#                exist, which makes the Pod spec less self-documenting.
+#     env[]    — explicit per key, self-documenting, but verbose and you must
+#                edit two files to add one setting.
+#   We use envFrom because there are eleven keys and they change together. For one
+#   or two keys, prefer explicit `env[]`.
+#
+# THE SECRET-VS-CONFIG TEST:
+#   "Would leaking this value harm anyone?" If no, it belongs here. Everything
+#   that fails that test is in 11-secret.example.yaml. Note what that means for
+#   JWT_ALGORITHM: the algorithm name is public information — HS256 is in the
+#   JWT header of every token you issue. The KEY is the secret, not the
+#   algorithm. Putting non-secrets in a Secret is not "extra safe"; it makes
+#   RBAC less useful and code review harder.
+#
+# ⚠️ GOTCHA — CONFIGMAP CHANGES DO NOT RESTART PODS:
+#   Values consumed as environment variables are read ONCE, at container start.
+#   Edit this file, `kubectl apply`, and running Pods keep the old values
+#   indefinitely: no error, no event, nothing in the logs. You must force a
+#   rollout:
+#       kubectl rollout restart deployment/tasks-api -n tasks-api
+#   (ConfigMaps mounted as FILES do update in place within ~1 minute — but not
+#   with subPath mounts, and your app has to re-read the file. Env vars are
+#   simpler, so we use env vars and accept the explicit restart.)
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tasks-api-config
+  namespace: tasks-api
+  labels:
+    app: tasks-api
+
+# `data` holds UTF-8 string key/value pairs.
+# (`binaryData` exists for base64-encoded binary content — certificates, small
+# binaries. Not needed here.)
+#
+# NOTE: every value must be a STRING. YAML would happily parse `false` as a
+# boolean and `60` as an integer, and the API server would reject the object.
+# Hence the quotes everywhere — this is the single most common ConfigMap error.
+data:
+
+  # ---- Application metadata -------------------------------------------------
+  # Surfaced by the /health endpoint and in the OpenAPI docs. Not sensitive.
+  APP_NAME: "Tasks API"
+  APP_VERSION: "0.1.0"
+
+  # Read as Settings.environment.
+  #
+  # WHY THIS MATTERS BEYOND COSMETICS: "development" is the app's default, and
+  # development modes typically mean verbose error responses. A stack trace in
+  # an HTTP response leaks file paths, library versions, and sometimes query
+  # fragments — useful reconnaissance for an attacker. Setting this explicitly
+  # per environment is a deliberate act, not decoration.
+  ENVIRONMENT: "production"
+
+  # ---- Database behaviour ---------------------------------------------------
+  # NOTE: DATABASE_URL is deliberately NOT here — it embeds the password, so it
+  # lives in the Secret. This is the one env var split across both sources, and
+  # 11-secret.example.yaml explains why we keep the whole DSN together.
+
+  # Settings.db_echo — logs every SQL statement SQLAlchemy emits.
+  #
+  # KEEP THIS "false" IN ANY SHARED ENVIRONMENT, for two reasons that aren't
+  # obvious: (1) volume — one request can emit a dozen statements, which is
+  # expensive at any real request rate and will dominate your log bill;
+  # (2) SQL text can contain user data in literals, which turns your log
+  # aggregator into an unaudited copy of your database. Useful locally, actively
+  # harmful in production.
+  DB_ECHO: "false"
+
+  # ---- Authentication policy (not the key itself) ---------------------------
+  # Settings.jwt_algorithm. HS256 = HMAC-SHA256, symmetric: the same secret
+  # signs and verifies.
+  #
+  # WHEN YOU'D CHANGE THIS: if a SEPARATE service needed to verify tokens this
+  # app issues. With HS256 you'd have to give that service the signing secret —
+  # so any service that can verify can also forge. RS256 (asymmetric) solves it:
+  # the issuer holds the private key, verifiers hold only the public key. That's
+  # a real architectural decision, and "we're a single service, so HS256 is
+  # sufficient and simpler" is the correct answer here — stated as a choice
+  # rather than an accident.
+  JWT_ALGORITHM: "HS256"
+
+  # Settings.access_token_expire_minutes.
+  #
+  # THE TRADE-OFF: this app has no token revocation list, so a leaked token is
+  # valid until it expires. Shorter windows shrink that exposure but mean more
+  # frequent re-authentication. 60 minutes is a common middle ground. The proper
+  # answer is short-lived access tokens plus refresh tokens — worth naming as
+  # the next step rather than pretending 60 minutes is a security control.
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+
+  # ---- Cache ---------------------------------------------------------------
+  # Settings.redis_url. `redis` is a Kubernetes Service name; CoreDNS resolves
+  # it in-cluster. The fully-qualified form is redis.tasks-api.svc.cluster.local,
+  # but the short name works because a Pod's /etc/resolv.conf search path
+  # includes its own namespace first.
+  #
+  # No credential in this URL, so it belongs in the ConfigMap. If Redis ever
+  # gains a password, this whole URL moves to the Secret — same reasoning as
+  # DATABASE_URL.
+  #
+  # The trailing /0 selects Redis logical database 0.
+  REDIS_URL: "redis://redis:6379/0"
+
+  # Settings.cache_enabled — a master switch. src/cache.py is written to degrade
+  # gracefully (a Redis failure becomes a cache miss, not a request failure),
+  # which is why this can be safely "true" even though Redis is a single replica
+  # with no persistence. That graceful degradation is a deliberate resilience
+  # property worth pointing at, not an accident.
+  CACHE_ENABLED: "true"
+
+  # ---- Rate limiting -------------------------------------------------------
+  # Settings.rate_limit, applied by slowapi.
+  RATE_LIMIT: "100/minute"
+
+  # Settings.rate_limit_storage_uri — WHERE THE COUNTERS LIVE. This one key is
+  # what makes RATE_LIMIT above mean what it says.
+  #
+  # ⚠️ THE BUG IT FIXES, BECAUSE IT'S WORTH UNDERSTANDING RATHER THAN JUST
+  #    COPYING:
+  #
+  #    slowapi's DEFAULT backend ("memory://") counts requests in the PROCESS's
+  #    own memory. Each replica therefore keeps its own independent counter. With
+  #    3 replicas behind a Service, a client gets up to 3 x 100 = 300 requests per
+  #    minute, not 100.
+  #
+  #    And it is inconsistent rather than merely 3x too loose: which counter a
+  #    request increments depends on which replica the Service picked, so the same
+  #    client is throttled on one request and allowed on the next. A brute-force
+  #    protection a caller can beat by retrying is not protection.
+  #
+  #    Nothing reports any of this. The config says 100/minute and looks correct.
+  #    It also silently degrades further every time someone — or the HPA in
+  #    Module 10 — adds a replica.
+  #
+  #    THE GENERAL LESSON, which transfers to every in-process stateful feature:
+  #    any counter, cache, lock, scheduler, or session store held in local process
+  #    memory breaks when you scale horizontally. Rate limiters, in-memory caches,
+  #    APScheduler jobs, and websocket registries are the same bug wearing
+  #    different clothes.
+  #
+  #      HORIZONTAL SCALING DOESN'T CREATE BUGS. IT REVEALS THE ONES YOU HAD.
+  #
+  #    The fixes are always one of three: move the state somewhere shared (this
+  #    line), elect a single owner (a leader election via a Lease), or take the
+  #    work out of the per-process path entirely (the migration Job, 30-*.yaml).
+  #
+  # ⚠️ DATABASE 1, NOT 0. REDIS_URL above uses database 0 for the cache. Redis
+  #    logical databases are separate keyspaces, so a FLUSHDB while debugging the
+  #    cache cannot wipe the rate-limit counters, and `--scan` in one doesn't
+  #    drown in the other's keys. One Redis, two isolated purposes.
+  #
+  # ⚠️ AN INTERACTION WORTH KNOWING ABOUT: 21-redis.yaml runs Redis with
+  #    `--maxmemory-policy allkeys-lru`, which is right for a cache and means ANY
+  #    key can be evicted under memory pressure — including a rate-limit counter,
+  #    so a client near its limit could get a fresh start. Unlikely at 200MB for
+  #    tiny counters, and acceptable because a rate limiter is a safety mechanism
+  #    rather than a source of truth. If it were not acceptable, the fix is a
+  #    SEPARATE Redis with `--maxmemory-policy noeviction`. Having noticed that
+  #    two workloads with different durability needs share one eviction policy —
+  #    and decided it's fine — is not the same as not having noticed.
+  #
+  # If Redis is unreachable, slowapi falls back to per-replica in-memory counters
+  # and keeps serving rather than failing every request (see src/rate_limit.py,
+  # which also bounds the Redis socket timeouts so that fallback is FAST — a
+  # measured 4041ms-per-request problem before those were set).
+  RATE_LIMIT_STORAGE_URI: "redis://redis:6379/1"
+
+  # ---- Readiness ------------------------------------------------------------
+  # Settings.readiness_timeout_seconds — how long /ready waits for the database
+  # before declaring this instance not-ready.
+  #
+  # ⚠️ MUST BE LOWER THAN readinessProbe.timeoutSeconds IN 40-deployment.yaml
+  #    (which is 3). kubelet abandoning its request does NOT stop the handler, so
+  #    an unbounded check would keep holding a pool connection — one leaked
+  #    connection every periodSeconds until the pool is empty, at which point the
+  #    health check has caused the outage it was meant to report.
+  #
+  #    These two numbers live in different files and nothing validates the
+  #    relationship between them. That is exactly the kind of cross-file coupling
+  #    worth a loud comment on BOTH sides — which is why 40-deployment.yaml says
+  #    the same thing from the other direction.
+  READINESS_TIMEOUT_SECONDS: "2.0"

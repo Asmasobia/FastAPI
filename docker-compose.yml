@@ -1,0 +1,139 @@
+# ==============================================================================
+# docker-compose.yml — run the FULL STACK (API + Postgres + Redis) with one
+# command:  docker compose up --build
+#
+# WHY COMPOSE: your app rarely runs alone. Compose defines all the services, how
+# they connect, and their startup order in one file, so anyone can boot the
+# entire system reproducibly. This is where the project graduates from "SQLite
+# in a file" to "real Postgres + Redis", proving the async DB layer swaps cleanly.
+#
+# (Docker isn't installed on your machine yet — this is here to learn and to run
+# once you install Docker Desktop.)
+# ==============================================================================
+
+services:
+  # ---- The FastAPI application ----
+  api:
+    build: .  # build the image from the Dockerfile in this directory.
+    ports:
+      - "8000:8000"  # host:container — reach the API at http://localhost:8000
+    environment:
+      # Point the app at the Postgres SERVICE by its name "db" (Compose provides
+      # DNS between services). This is the ONE change that moves us from SQLite
+      # to Postgres — no code edits, thanks to the async engine abstraction.
+      DATABASE_URL: "postgresql+asyncpg://postgres:pass@db:5432/tasks"
+      REDIS_URL: "redis://redis:6379/0"
+      CACHE_ENABLED: "true"
+      JWT_SECRET_KEY: "compose-dev-secret-change-in-real-deployments"
+      # Shared rate-limit counters, on logical database 1 so a FLUSHDB while
+      # debugging the cache (database 0) can't wipe them.
+      #
+      # With ONE api container this is functionally identical to "memory://" — so
+      # why set it? Because `docker compose up --scale api=3` is the cheapest way
+      # to SEE the per-process-counter bug and then see it fixed, without needing
+      # Kubernetes at all. Compose is a perfectly good laboratory for
+      # horizontal-scaling bugs; it just isn't a production runtime.
+      RATE_LIMIT_STORAGE_URI: "redis://redis:6379/1"
+    depends_on:
+      # Wait for db and redis to be HEALTHY before starting the API, so the app
+      # doesn't crash trying to connect before Postgres is ready to accept
+      # connections. depends_on + healthcheck is the correct ordering pattern.
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Run migrations, THEN start the server. `sh -c` lets us chain the two.
+    #
+    # ⚠️ THIS IS CORRECT HERE AND WRONG IN KUBERNETES, AND THE DIFFERENCE IS THE
+    #    THIRD LESSON OF THIS PROJECT. It is left as-is DELIBERATELY — it is not an
+    #    oversight, and please don't "fix" it to match the k8s manifests.
+    #
+    #    WHY IT IS FINE HERE: one container starts, so `alembic upgrade head` runs
+    #    exactly once. One command boots the whole stack, which is what local
+    #    development should cost.
+    #
+    #    WHY IT IS WRONG AT REPLICAS > 1: all replicas start simultaneously and all
+    #    run `alembic upgrade head` against the SAME database. Alembic takes no
+    #    cross-process lock by default, so they all read the same starting revision
+    #    and attempt the same DDL. Some fail — "relation already exists", or a
+    #    deadlock on the alembic_version row — exit non-zero, get restarted, and try
+    #    again. You get a CrashLoopBackOff that EVENTUALLY RESOLVES ITSELF once one
+    #    replica wins, which makes a structural bug look like a transient blip and
+    #    is exactly why this survives in real codebases. A multi-step migration can
+    #    leave a partially applied schema with a version row claiming otherwise.
+    #
+    #    Prove it to yourself:  docker compose up --scale api=3
+    #
+    #    THE FIX in Kubernetes is k8s/30-migration-job.yaml — a Job, which runs a
+    #    Pod to completion exactly ONCE. Correspondingly, k8s/40-deployment.yaml
+    #    sets NO command at all, so the Dockerfile's CMD (uvicorn only) runs. That
+    #    omission is a positive decision, not a gap.
+    #
+    #    ⚠️ Note what an initContainer would NOT fix: it runs in EVERY Pod, so 3
+    #       replicas still means 3 concurrent migrations. Identical bug, relocated.
+    #       It is the most commonly proposed wrong answer to this problem.
+    #
+    #    THE TRANSFERABLE POINT: two environments can have two different correct
+    #    answers, and recognising that is not sloppiness — it is knowing which
+    #    property each environment actually needs. Compose needs one-command boot;
+    #    Kubernetes needs "exactly once" under concurrency.
+    #    ⚠️ NOTE THE `exec` BEFORE uvicorn — it is not decoration, and this file
+    #       did not have it originally. Module 09's subject:
+    #
+    #       `sh -c "A && B"` is a COMPOUND command, so the shell cannot optimise
+    #       itself away with an implicit exec. It stays alive as PID 1 with uvicorn
+    #       as its child. Signals are delivered to PID 1 — so `docker compose stop`
+    #       sends SIGTERM to the SHELL, which does not forward it to children while
+    #       waiting. uvicorn never hears about the shutdown at all. Docker then
+    #       waits out its 10-second grace period and SIGKILLs the lot.
+    #
+    #       The visible symptom is "stopping the stack is slow", which nobody files
+    #       a bug about. The invisible one is that FastAPI's lifespan shutdown never
+    #       runs: the Redis client is not closed and the database pool is not
+    #       disposed. Locally that costs nothing. The same mistake in a Kubernetes
+    #       manifest means every rollout takes terminationGracePeriodSeconds and
+    #       kills in-flight requests.
+    #
+    #       `exec` makes the shell REPLACE ITSELF with uvicorn, so uvicorn becomes
+    #       PID 1 and receives the signal directly. One word, and now the
+    #       chained-migration convenience costs nothing.
+    #
+    #       (k8s/40-deployment.yaml is immune to this by not setting `command` at
+    #       all — the Dockerfile's exec-form CMD makes uvicorn PID 1 already.)
+    command: >
+      sh -c "alembic upgrade head &&
+             exec uvicorn src.main:app --host 0.0.0.0 --port 8000"
+
+  # ---- PostgreSQL database ----
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: tasks
+    ports:
+      - "5432:5432"  # exposed so you can also connect from your host (psql/GUI).
+    volumes:
+      # Persist DB data across container restarts in a named volume. Without
+      # this, `docker compose down` would wipe your data every time.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready reports when Postgres is actually accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---- Redis cache ----
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+# Named volume declaration for Postgres persistence.
+volumes:
+  pgdata:

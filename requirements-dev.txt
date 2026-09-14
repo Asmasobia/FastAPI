@@ -1,0 +1,24 @@
+# ==============================================================================
+# requirements-dev.txt — tools needed ONLY for development and testing.
+#
+# WHY SEPARATE FROM requirements.txt?
+#   Your production Docker image should not ship pytest, coverage tools, etc.
+#   Smaller image = smaller attack surface + faster deploys. So dev tools live
+#   here and are installed with:  pip install -r requirements-dev.txt
+#   (This file installs the runtime deps too via the "-r" include below.)
+# ==============================================================================
+
+# Include everything from the runtime requirements so a dev has the full set.
+-r requirements.txt
+
+# ---- Testing ----
+# pytest: the test runner.
+pytest==8.3.4
+# pytest-asyncio: lets pytest run "async def" test functions (needed because our
+# code is async — we must await the app and the DB in tests).
+pytest-asyncio==0.25.2
+# httpx: async HTTP client. We drive the app in-process through its ASGI
+# interface using httpx's ASGITransport (no real network/port needed).
+httpx==0.28.1
+# pytest-cov: coverage reporting (pytest --cov). Tells you which lines tests hit.
+pytest-cov==6.0.0

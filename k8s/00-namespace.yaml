@@ -1,0 +1,52 @@
+# ==============================================================================
+# 00-namespace.yaml — the container for everything else.
+#
+# WHY A NAMESPACE INSTEAD OF `default`:
+#   `default` works, and every tutorial uses it. Real clusters don't, for four
+#   concrete reasons:
+#
+#   1. DELETION IS ONE COMMAND. `kubectl delete namespace tasks-api` removes
+#      every object inside it. Cleaning up individual objects from `default`
+#      means remembering what you created — and you will forget something.
+#   2. RBAC IS MOSTLY NAMESPACE-SCOPED. "This team can deploy to this namespace"
+#      is the standard unit of access control. Without namespaces you either
+#      grant cluster-wide access or nothing.
+#   3. ResourceQuota AND LimitRange ARE NAMESPACE-SCOPED. Capping total CPU or
+#      memory for an application is only expressible per namespace.
+#   4. NAME COLLISIONS DISAPPEAR. Object names must be unique within a
+#      namespace, not cluster-wide. Two teams can both have a Service called
+#      `api` with no conflict.
+#
+# WHY THE FILENAME STARTS WITH 00:
+#   `kubectl apply -f k8s/` processes files in ALPHABETICAL order, so the numeric
+#   prefix controls apply order. The namespace must exist before anything can be
+#   created inside it. Tens (00, 10, 20...) leave room to insert later without
+#   renaming everything.
+#
+#   Caveat worth knowing: this orders CREATION, not READINESS. Kubernetes will
+#   happily create a Deployment whose database isn't up yet. Ordering by
+#   readiness needs Helm hooks, ArgoCD sync waves, or initContainers — see
+#   30-migration-job.yaml.
+# ==============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tasks-api
+
+  labels:
+    # These are the Kubernetes "recommended labels" (app.kubernetes.io/*).
+    #
+    # WHY USE A STANDARD PREFIX RATHER THAN INVENTING YOUR OWN:
+    #   Tooling reads them. `kubectl` grouping, Helm, ArgoCD, Prometheus service
+    #   discovery, and most dashboards all understand app.kubernetes.io/name and
+    #   app.kubernetes.io/instance. Inventing `myapp/name` means writing your own
+    #   selectors forever.
+    #
+    # A caution that matters later: labels used in a Deployment's
+    # spec.selector.matchLabels are IMMUTABLE after creation. So pick a small,
+    # stable set for selectors (we use plain `app:`) and put the descriptive,
+    # likely-to-change ones (version, part-of) here in metadata only.
+    app.kubernetes.io/name: tasks-api
+    app.kubernetes.io/part-of: tasks-api
+    app.kubernetes.io/managed-by: kubectl

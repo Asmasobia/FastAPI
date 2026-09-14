@@ -1,0 +1,182 @@
+# ==============================================================================
+# 51-pdb.yaml — PodDisruptionBudget for the application.
+#
+# WHAT THIS OBJECT IS FOR
+#   Everything up to now protected the application from ITSELF: probes catch a
+#   broken process, resources stop it starving its neighbours, preStop stops a
+#   rollout dropping requests, the HPA sizes the fleet. None of that helps with
+#   the disruptions that come from OUTSIDE the application:
+#
+#     * a cluster administrator running `kubectl drain` to patch a kernel
+#     * a managed node pool upgrading itself, one node at a time, on a schedule
+#     * the cluster autoscaler consolidating workloads to remove an idle node
+#     * the descheduler rebalancing Pods
+#
+#   Every one of those is a well-behaved system asking politely to remove your
+#   Pods, and none of them knows how many of yours may safely go at once. THIS
+#   OBJECT IS THAT ANSWER, and it is the only way to give it.
+#
+#   Without a PDB, a node drain removes every one of this app's Pods that happens
+#   to be on that node, simultaneously, and the drain reports success.
+#
+# ⚠️ THE ONE-SENTENCE MENTAL MODEL: a PDB is a contract with the cluster's own
+#    AUTOMATION. It is not access control, it is not a safety net for a human with
+#    kubectl (`kubectl delete pod` ignores it entirely), and it does not help with
+#    involuntary disruption — a node that dies takes your Pods with it and no
+#    budget was consulted.
+#
+# APPLY
+#   kubectl apply -f k8s/51-pdb.yaml
+#
+# THE ONE COMMAND THAT MATTERS
+#   kubectl get pdb -n tasks-api
+#
+#   NAME        MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+#   tasks-api   2               N/A               1                     5s
+#                                                 ^^^^^^^^^^^^^^^^^^^
+#   ALLOWED DISRUPTIONS is the entire object in one number: how many Pods may be
+#   voluntarily evicted right now. 3 healthy - 2 required = 1.
+#
+#   ⚠️ IF IT READS 0 AND THE APP IS NOT MID-ROLLOUT, EVERY NODE DRAIN TOUCHING
+#      THESE PODS WILL HANG. That is the number to check before a cluster upgrade
+#      and the number to alert on. It is also the number that reads as "very
+#      protected" to anyone who does not know what the column means.
+#
+#   kubectl describe pdb tasks-api -n tasks-api      # currentHealthy / desired
+# ==============================================================================
+
+apiVersion: policy/v1
+# ⚠️ policy/v1, NOT policy/v1beta1. The beta API was REMOVED in Kubernetes 1.25 —
+#    a v1beta1 manifest does not work-with-a-warning, it fails outright. Most
+#    older blog posts and Stack Overflow answers still show v1beta1.
+kind: PodDisruptionBudget
+metadata:
+  name: tasks-api
+  namespace: tasks-api
+  labels:
+    app: tasks-api
+spec:
+  # ---- the selector: nothing links this to the Deployment ---------------------
+  #
+  # ⚠️ A PDB finds Pods BY LABEL, entirely independently of any Deployment. There
+  #    is no ownership reference, no validation, and no warning if it matches
+  #    nothing. Two ways that bites:
+  #
+  #      1. A SELECTOR MATCHING NOTHING produces a healthy-looking PDB that
+  #         protects nothing, reporting `ALLOWED DISRUPTIONS: 0` with
+  #         `currentHealthy: 0` — which looks strict and is vacuous. This is why
+  #         "run `kubectl get pdb` and read the number" is a step and not a
+  #         formality.
+  #      2. TWO PDBs MATCHING ONE POD is a hard failure at eviction time.
+  #         Kubernetes refuses to decide which budget wins, so the eviction is
+  #         rejected regardless of the numbers. A broad namespace-wide "protect
+  #         everything" PDB overlapping a specific one blocks every drain, and the
+  #         error message does not obviously say why.
+  #
+  # These labels match spec.template.metadata.labels in 40-deployment.yaml exactly.
+  # They are intentionally the SAME pair used by 41-service.yaml's selector: this
+  # PDB should protect precisely the set of Pods that receives traffic, because
+  # "available" means "able to serve", not "existing".
+  selector:
+    matchLabels:
+      app: tasks-api
+      component: api
+
+  # ---- minAvailable: 2 --------------------------------------------------------
+  #
+  # THE CHOICE BETWEEN THE TWO FIELDS (set one, never both):
+  #
+  #   minAvailable   = a FLOOR on capacity.  "Always keep at least N serving."
+  #   maxUnavailable = a CEILING on concurrent disruption. "Never take more than N
+  #                    down at once."
+  #
+  #   They overlap at a fixed replica count and diverge under an HPA, which this
+  #   app now has. An ABSOLUTE minAvailable keeps meaning the same thing as the
+  #   fleet grows (2 is 2 whether you are at 3 replicas or 6). A PERCENTAGE moves
+  #   with the fleet, which is what you want for large deployments —
+  #   `maxUnavailable: 10%` lets a 200-Pod service drain 20 at a time without
+  #   anyone editing this file every time it resizes.
+  #
+  # WHY minAvailable: 2 HERE:
+  #
+  #   * It equals minReplicas - 1 (50-hpa.yaml sets minReplicas: 3), so exactly ONE
+  #     Pod may be evicted at a time. That is precisely what a rolling node upgrade
+  #     needs, and it leaves two Pods serving throughout.
+  #   * At the HPA's ceiling of 6 replicas it allows 4 concurrent evictions, which
+  #     is a faster drain with capacity still above the floor. The absolute form
+  #     gets that for free; `maxUnavailable: 1` would keep drains slow forever.
+  #   * 2 remaining Pods means the service survives the evicted Pod's replacement
+  #     ALSO being slow to become Ready — a real scenario during a busy drain.
+  #
+  # ⚠️ THIS IS THE SAME DECISION AS minReplicas: 3, VIEWED FROM THE OTHER SIDE.
+  #    A PDB with minAvailable: 2 is only satisfiable above 2 replicas. Set
+  #    minReplicas to 2 and this PDB permanently allows zero disruptions; set it to
+  #    1 and drains block forever. The availability floor and the disruption budget
+  #    are coupled, they live in two files, and nothing checks that they agree.
+  #    That coupling is the thing to remember.
+  #
+  # ⚠️ THE DEADLOCKS, WHICH ALL LOOK LIKE EXTRA SAFETY:
+  #
+  #      minAvailable: 3   with 3 replicas  ->  allowed disruptions 0, forever
+  #      minAvailable: 100%                 ->  same
+  #      maxUnavailable: 0                  ->  same
+  #      ANY PDB on a single-replica Deployment -> same
+  #
+  #    Each blocks every voluntary eviction permanently. Consequences: node drains
+  #    retry until they time out, managed node-pool upgrades stall mid-way, cluster
+  #    autoscaler scale-down never runs so you pay for empty nodes, and security
+  #    patches do not get applied.
+  #
+  #    A PDB SET TO ITS MOST PROTECTIVE VALUE IS NOT PROTECTION, IT IS A SCHEDULED
+  #    OUTAGE — because the maintenance it blocks is maintenance you need, and
+  #    blocking it forever means it eventually happens in a hurry, badly.
+  minAvailable: 2
+
+  # ---- unhealthyPodEvictionPolicy: left unset, deliberately -------------------
+  #
+  # The default (`IfHealthyBudget`) says an UNHEALTHY Pod may only be evicted if
+  # the budget currently allows a disruption. That produces a genuine deadlock:
+  #
+  #     All 3 Pods are broken — bad image, crash loop, wedged event loop.
+  #     currentHealthy = 0, so ALLOWED DISRUPTIONS = 0.
+  #     Therefore NOTHING may be evicted, including the broken Pods.
+  #     The PDB is now protecting an outage from being repaired.
+  #
+  # `AlwaysAllow` fixes it, and is obviously right once stated: evicting a Pod that
+  # is not serving cannot reduce availability.
+  #
+  #     unhealthyPodEvictionPolicy: AlwaysAllow
+  #
+  # ⚠️ NOT SET HERE because it is beta in 1.27 and GA in 1.31. On an older cluster
+  #    the API server SILENTLY DROPS unknown fields, so this would apply cleanly,
+  #    appear in your manifest, and do nothing — which is worse than omitting it,
+  #    because you would believe you were protected. Check with:
+  #
+  #      kubectl get pdb tasks-api -n tasks-api -o yaml | grep unhealthyPod
+  #
+  #    If it survives the round trip, your cluster supports it. Then set it.
+  #
+  # ---- WHAT THIS OBJECT STILL DOES NOT DO ------------------------------------
+  #
+  #   * It does not stop `kubectl delete pod`. A PDB constrains the EVICTION
+  #     subresource; delete is a different API call and is not checked. Deliberate:
+  #     delete is the break-glass path. So `kubectl delete pod -l app=tasks-api`
+  #     takes the whole service down with this file in place and reports success.
+  #   * It does not help with INVOLUNTARY disruption. A kernel panic, a failed
+  #     disk, a network partition, an OOMKill, a terminated spot instance — none of
+  #     those ask permission. A PDB covers voluntary disruption only, which is
+  #     roughly "things a controller or an operator chose to do".
+  #   * It does not extend a termination grace period. It controls HOW MANY Pods go
+  #     down at once; 40-deployment.yaml's preStop hook and
+  #     terminationGracePeriodSeconds control whether EACH ONE goes down without
+  #     dropping requests (Module 09). Two different questions, and conflating them
+  #     is common.
+  #   * It is not respected by preemption. A higher-priority Pod displacing yours
+  #     honours PDBs on a best-effort basis only.
+  #   * ⚠️ ON A SINGLE-NODE CLUSTER IT CANNOT DELIVER WHAT IT PROMISES. Draining
+  #     the only node means evicting all 3 Pods, and no budget can keep 2 available
+  #     when there is nowhere else to put them. The drain will simply block. This
+  #     object is correct, applying it is worth it (it is what production needs, and
+  #     it makes the drain FAIL LOUDLY instead of quietly destroying the service),
+  #     but "highly available" needs at least 3 nodes across failure domains.
+  #     Saying that yourself is much stronger than being caught by it.

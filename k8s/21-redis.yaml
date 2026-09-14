@@ -1,0 +1,329 @@
+# ==============================================================================
+# 21-redis.yaml — Redis as a Deployment + ClusterIP Service.
+#
+# THE INTERESTING DECISION IN THIS FILE:
+#   Postgres got a StatefulSet with a PersistentVolumeClaim. Redis — which is
+#   also a data store — gets a plain Deployment with NO persistence at all.
+#
+#   That looks inconsistent until you ask the right question. The question is not
+#   "is this software a database?" It is:
+#
+#       "If this Pod is destroyed right now, what have I lost?"
+#
+#   Postgres: the user's tasks. Unrecoverable. Needs durable identity + storage.
+#   Redis here: cached query results. Recoverable — the next request recomputes
+#              them from Postgres. Cost of loss is one slow request, not data.
+#
+#   THE WORKLOAD'S ROLE DECIDES THE CONTROLLER, NOT THE SOFTWARE CATEGORY. The
+#   same redis:7 image would need a StatefulSet if it were holding session state
+#   users can't afford to lose, or a job queue whose messages must survive a
+#   restart. Being able to articulate that distinction — rather than reciting
+#   "databases get StatefulSets" — is exactly what separates understanding from
+#   pattern-matching.
+#
+# WHAT THIS COSTS, STATED HONESTLY:
+#   • Every restart empties the cache. There will be a burst of cache misses and
+#     a latency spike while it refills — a "thundering herd" if the app is busy.
+#     Acceptable for this app; not acceptable if the cache were absorbing load
+#     the database cannot survive without.
+#   • No high availability. One replica; if the Pod is rescheduled, the cache is
+#     unavailable for a few seconds.
+#
+#   Both are only acceptable because src/cache.py DEGRADES GRACEFULLY: a Redis
+#   failure becomes a cache miss, not a request failure. That property is what
+#   makes the cheap option safe. Without it, the same manifest would turn a Redis
+#   hiccup into a full outage — and the manifest would look identical, which is
+#   why this reasoning belongs written down next to the YAML.
+#
+# ⚠️ AND ONE THING TO CHECK RATHER THAN ASSUME:
+#   Graceful degradation is only real if the client has a short CONNECT TIMEOUT.
+#   A redis client with no timeout doesn't "miss the cache" when Redis is gone —
+#   it blocks, and your requests hang instead of being merely slower. If you take
+#   one thing from this file into future projects, take that: "we degrade
+#   gracefully" is a claim to verify with a test, not a design intention.
+#   Verify it by deleting this Deployment and confirming the API still answers.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# PART 1 — the Service
+# ------------------------------------------------------------------------------
+# A NORMAL ClusterIP Service this time, not headless. Contrast with Postgres:
+#   • Postgres needed per-Pod DNS identity  -> headless (clusterIP: None)
+#   • Redis is one interchangeable instance -> a stable virtual IP is ideal
+#
+# ClusterIP gives you a virtual IP that survives Pod replacement. That's the
+# property that matters: the app's REDIS_URL says `redis://redis:6379/0` and
+# never has to change, even though the Pod IP changes on every restart. Pod IPs
+# are ephemeral; Service IPs are not. That indirection is the entire reason
+# Services exist.
+# ------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis                 # This name IS the DNS hostname. It must match the
+                              # host in REDIS_URL in 10-configmap.yaml — nothing
+                              # validates that they agree, so a rename here
+                              # breaks the app with a DNS error and no hint about
+                              # where the mismatch is.
+  namespace: tasks-api
+  labels:
+    app: redis
+spec:
+  type: ClusterIP             # The default. Written explicitly because "the
+                              # default" is not the same as "chosen" — the point
+                              # of this repo is that every value is a decision.
+                              #
+                              # Reachable only from inside the cluster. Correct:
+                              # Redis here has NO PASSWORD, so exposing it via
+                              # NodePort or LoadBalancer would hand anyone who
+                              # can reach the node full read/write access to your
+                              # cache (and `FLUSHALL`, and `CONFIG SET`). The
+                              # network boundary IS the authentication here,
+                              # which is a fact to be conscious of rather than
+                              # comfortable with.
+  selector:
+    app: redis                # Matches the Pod template labels below. Label
+                              # matching, not ownership — see 20-postgres.yaml.
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+
+---
+# ------------------------------------------------------------------------------
+# PART 2 — the Deployment
+# ------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: tasks-api
+  labels:
+    app: redis
+
+spec:
+  replicas: 1
+  # WHY NOT MORE: Redis replicas are not interchangeable cache nodes. Plain Redis
+  # replication is primary/replica — replicas are read-only, so a client that
+  # round-robins would fail every write. Real horizontal scaling needs Redis
+  # Cluster (sharding, and a cluster-aware client) or Sentinel (failover).
+  #
+  # Scaling this to 2 would NOT double your cache. It would give you two
+  # independent caches receiving alternate requests, halving your hit rate while
+  # doubling memory use — and it would look like it was working. Silent
+  # degradation is the failure mode to watch for whenever you scale something
+  # that holds local state. (Same underlying bug as the rate limiter in
+  # 10-configmap.yaml: local state + horizontal scaling = wrong answers, quietly.)
+
+  selector:
+    matchLabels:
+      app: redis              # Immutable after creation.
+
+  # ---- Rollout strategy ----------------------------------------------------
+  # The DEFAULT strategy is RollingUpdate with maxSurge 25% / maxUnavailable 25%.
+  # At replicas: 1 that rounds to maxSurge 1, maxUnavailable 0 — so Kubernetes
+  # would try to start a SECOND Redis Pod before terminating the first.
+  #
+  # Harmless for a stateless cache, but we choose Recreate deliberately:
+  strategy:
+    type: Recreate
+    # Recreate = terminate the old Pod completely, THEN start the new one.
+    #
+    # WHY: it guarantees only one Redis process at a time. That doesn't matter
+    # today (no volume, no persistence) but it's the habit you want, because the
+    # moment you attach a ReadWriteOnce volume, RollingUpdate DEADLOCKS: the new
+    # Pod cannot mount the volume until the old Pod releases it, and the old Pod
+    # won't terminate until the new one is ready. The Deployment sits in
+    # `ContainerCreating` forever with a `FailedAttachVolume` event, and the
+    # cause is a strategy you never consciously chose.
+    #
+    # THE COST, stated plainly: brief total unavailability during any update
+    # (a few seconds). For a gracefully-degrading cache that's a handful of cache
+    # misses. For anything user-facing it would be unacceptable — 40-deployment.yaml
+    # uses RollingUpdate with maxUnavailable: 0 for exactly that reason.
+    #
+    # TRANSFERABLE RULE: single-writer workloads with a RWO volume -> Recreate.
+    # Stateless replicas -> RollingUpdate. Deciding this before you add the volume
+    # saves you debugging a deadlock later.
+
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      # Redis shuts down fast and holds nothing we care about, so the default
+      # 30-second grace period is more than enough. Module 09 covers why the app
+      # needs more thought here.
+      terminationGracePeriodSeconds: 10
+
+      containers:
+        - name: redis
+
+          # `7-alpine`: minor-version family pinned (patch updates still flow),
+          # Alpine base for size (~40MB vs ~130MB).
+          #
+          # THE ALPINE CAVEAT, since it's a decision people make casually and
+          # regret specifically: Alpine uses musl libc instead of glibc. For a
+          # precompiled C daemon like Redis that's a non-issue. For PYTHON images
+          # it is a real problem — many wheels are built for glibc (manylinux),
+          # so on Alpine pip falls back to compiling from source, which makes
+          # builds minutes slower and occasionally fails outright. That's exactly
+          # why the app's own Dockerfile uses `python:3.12-slim`, not
+          # `python:3.12-alpine`. Same instinct, opposite correct answer, because
+          # the workloads differ.
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: redis
+              containerPort: 6379
+
+          # ---- Command: overriding the image's default -----------------------
+          # WHY OVERRIDE AT ALL: the default redis:7 config allows unlimited
+          # memory growth. In Kubernetes that is actively dangerous. Walk the
+          # failure through, because it's the kind of thing that only shows up
+          # under real traffic:
+          #
+          #   1. The cache fills up over hours or days.
+          #   2. Redis crosses the container's memory LIMIT.
+          #   3. Memory is INCOMPRESSIBLE, so the kernel OOM-kills the container
+          #      (exit code 137) — no warning, no graceful handling.
+          #   4. Kubernetes restarts it. Empty cache, latency spike.
+          #   5. It fills up again. Repeat forever, on a period long enough that
+          #      nobody connects the restarts to the cause.
+          #
+          # `maxmemory` + an eviction policy converts that crash loop into
+          # ORDERLY EVICTION: Redis drops old keys and keeps serving. A cache that
+          # forgets things is behaving correctly; a cache that dies is not.
+          #
+          # THE PATTERN TO CARRY FORWARD: whenever you set a container memory
+          # limit, ask whether the process INSIDE knows about it. Redis needs
+          # `maxmemory`; the JVM needs `-XX:MaxRAMPercentage` (or it sizes the
+          # heap from the HOST's RAM and gets killed); Node needs
+          # `--max-old-space-size`; Postgres needs `shared_buffers` sized sanely.
+          # A container limit the runtime is unaware of is a delayed OOMKill,
+          # not protection.
+          command:
+            - redis-server
+            - --maxmemory
+            - 200mb                 # Deliberately BELOW the 256Mi limit below.
+                                    # The gap is headroom: Redis' own overhead
+                                    # (client buffers, replication backlog,
+                                    # fragmentation) sits on top of the dataset,
+                                    # so maxmemory == limit still gets you
+                                    # OOMKilled. ~20-25% headroom is the usual
+                                    # rule of thumb.
+            - --maxmemory-policy
+            - allkeys-lru           # Evict the least-recently-used key of ANY key
+                                    # when full.
+                                    #
+                                    # WHY allkeys-lru AND NOT THE DEFAULT:
+                                    #   The default is `noeviction` — Redis starts
+                                    #   returning errors on writes instead of
+                                    #   evicting. For a CACHE that is wrong: you
+                                    #   want it to forget, not to fail.
+                                    #
+                                    #   `volatile-lru` (the other common pick)
+                                    #   only evicts keys that have a TTL set. If
+                                    #   any code path ever writes a key WITHOUT a
+                                    #   TTL, those keys accumulate permanently and
+                                    #   you're back to OOM. allkeys-lru is the
+                                    #   safe default precisely because it doesn't
+                                    #   depend on every caller remembering a TTL.
+                                    #
+                                    #   Use `noeviction` when Redis is a QUEUE or
+                                    #   a source of truth — there, silently
+                                    #   dropping data is far worse than an error.
+                                    #   Again: role decides, not software.
+            - --save
+            - ""                    # Disable RDB snapshotting entirely.
+                                    #
+                                    # WHY: with no volume mounted, snapshots would
+                                    # be written to the container's ephemeral
+                                    # writable layer — consuming node disk,
+                                    # forking the process (which can briefly
+                                    # DOUBLE memory usage via copy-on-write, and
+                                    # is a real cause of surprise OOMKills), and
+                                    # then being thrown away on restart anyway.
+                                    # All cost, zero benefit.
+                                    #
+                                    # This also documents intent: an empty --save
+                                    # says "ephemeral by design", so nobody later
+                                    # assumes this cache survives a restart.
+
+          # ---- Probes --------------------------------------------------------
+          # `redis-cli ping` speaks the Redis protocol and expects PONG. Same
+          # principle as pg_isready: probe the layer clients use.
+          #
+          # A tcpSocket probe would pass as soon as the port is bound, which is
+          # true even while Redis is still loading a dataset and answering
+          # -LOADING to every command. Protocol-level checks catch that; TCP
+          # checks don't.
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+            # Less conservative than Postgres' liveness probe, and that asymmetry
+            # is the point: restarting Redis costs a cold cache; restarting
+            # Postgres costs a transaction rollback, a recovery pass, and possibly
+            # a connection storm from the app. Match probe aggressiveness to the
+            # COST OF A RESTART, not to a house style.
+            #
+            # ⚠️ `exec` probes are the expensive kind: each one forks a process
+            # inside the container. At periodSeconds: 1 across many replicas
+            # that's measurable CPU. Prefer httpGet when the app offers an
+            # endpoint; use exec when it doesn't (as here — Redis speaks no HTTP).
+
+          resources:
+            requests:
+              memory: "64Mi"       # Idle Redis is genuinely tiny.
+              cpu: "50m"
+            limits:
+              memory: "256Mi"      # 200mb maxmemory + ~25% headroom. See above.
+              cpu: "500m"
+              # Redis is single-threaded for command execution, so it cannot use
+              # more than one core for that work regardless. 500m throttles it to
+              # half a core, which is ample for this workload and stops a runaway
+              # KEYS command from starving other Pods on the node.
+
+          # ---- Security context ---------------------------------------------
+          # Unlike Postgres, Redis has NO reason to touch root: no data directory
+          # to chown, because there's no volume. So we apply the full hardening
+          # set, and it just works.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999            # `redis` user in the official image.
+            allowPrivilegeEscalation: false
+            # ^ Blocks setuid binaries from gaining privileges. Closes a standard
+            #   container-escape stepping stone. Almost never breaks anything.
+            capabilities:
+              drop: ["ALL"]
+            # ^ Linux capabilities are the fine-grained pieces of root's power
+            #   (bind low ports, change file ownership, load kernel modules...).
+            #   Docker grants ~14 by default. Redis needs none of them —
+            #   6379 is above 1024, so no NET_BIND_SERVICE required.
+            readOnlyRootFilesystem: true
+            # ^ Viable specifically BECAUSE we disabled snapshotting with
+            #   --save "". Re-enable persistence and this must come off (or you
+            #   must mount a writable volume at the save path), which is a nice
+            #   illustration of how these settings interact rather than stack
+            #   independently.
+            #
+            #   WORTH KNOWING: readOnlyRootFilesystem is the hardening flag most
+            #   likely to break a container, and the error is usually an opaque
+            #   "read-only file system" from deep inside a library. If a container
+            #   won't start after hardening, this is the first flag to test by
+            #   removing — and then the right fix is usually an emptyDir mounted
+            #   at whatever path needed writing, not leaving it off.
