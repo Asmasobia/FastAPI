@@ -1,0 +1,39 @@
+# ------------------------------------------------------------------------------
+# .gitattributes — how git should treat the bytes in these files.
+#
+# WHY THIS FILE EXISTS: git has a per-machine setting, `core.autocrlf`. On Windows
+# it is commonly `true`, which means "store LF in the repository, but write CRLF
+# into my working directory on checkout". It is not shared between clones, so
+# every contributor and every CI runner may have it set differently.
+#
+# Two things go wrong without this file, and neither one looks like a
+# line-endings problem when you hit it:
+#
+#   1. Phantom diffs. Someone changes one line, and `git diff` shows all 800 lines
+#      of the file as modified, because the endings were rewritten too. The real
+#      change becomes unreviewable.
+#
+#   2. Broken containers. This project ships a Dockerfile. A shell script or
+#      entrypoint checked out with CRLF fails inside a Linux image with
+#      `bad interpreter: /bin/sh^M` — a message that sends people looking at the
+#      wrong thing entirely, because the file looks correct in every editor.
+#
+# `text=auto eol=lf` tells git: treat these as text, normalise to LF on commit,
+# AND check them out as LF regardless of what `core.autocrlf` says locally. The
+# bytes on disk then match the bytes in the repository on every platform.
+#
+# WHY HERE RATHER THAN A GIT SETTING: .gitattributes is committed, so it applies
+# to everyone who clones, including CI. A `git config` fix works on exactly one
+# machine and has to be remembered again on the next one. Configuration that must
+# hold for the project belongs in the project.
+# ------------------------------------------------------------------------------
+
+* text=auto eol=lf
+
+# Explicitly binary, so git never attempts line-ending conversion on them.
+# Rewriting bytes inside an image that happened to look like a CRLF corrupts it.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.db binary
