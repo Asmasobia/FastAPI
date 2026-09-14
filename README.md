@@ -32,7 +32,7 @@ data.
 | **SQLite (dev) / Postgres (prod)** | Runs with **zero setup** locally; swaps to Postgres via **one env var**, no code change. |
 | **Alembic** | Versioned, reversible schema migrations instead of destructive recreation. |
 | **Redis** | Optional read-through cache; the app degrades gracefully if it's absent. |
-| **slowapi** | Simple per-client rate limiting. |
+| **slowapi** | Per-client rate limiting, with the counters in **Redis** so the limit still means what it says across multiple replicas (`memory://` locally, so `pytest` needs no Redis). |
 | **pytest + httpx** | Async, in-process endpoint tests with swappable dependencies. |
 
 ---
@@ -202,6 +202,56 @@ server.
 
 ---
 
+## Deploy it to Kubernetes
+
+`k8s/` holds a complete, commented deployment — 11 manifests, applied in numeric
+order. Full walkthrough and troubleshooting in **[`k8s/README.md`](k8s/README.md)**.
+
+```bash
+kubectl apply -f k8s/00-namespace.yaml
+cp k8s/11-secret.example.yaml k8s/11-secret.yaml   # fill in real values (git-ignored)
+kubectl apply -f k8s/          # remaining manifests, numeric order
+kubectl -n tasks-api rollout status deploy/tasks-api
+```
+
+| Manifest | What it demonstrates |
+|---|---|
+| `00-namespace` | Blast-radius boundary; everything else is namespaced. |
+| `10-configmap` | Non-secret config. **Overrides `RATE_LIMIT_STORAGE_URI` to `redis://redis:6379/1`** so the rate limit is shared across replicas rather than per-process. |
+| `11-secret.example` | Template only. A Secret is base64-**encoded**, not encrypted, so the real file is git-ignored — see the header comment. |
+| `20-postgres` / `21-redis` | Stateful dependencies. Redis runs `--maxmemory-policy allkeys-lru`. |
+| `30-migration-job` | Schema migration as a **Job that must succeed before rollout** — not something the app does on boot, where N replicas would race. |
+| `40-deployment` | **Liveness *and* readiness probes with different semantics**, resource requests/limits, non-root securityContext. |
+| `41-service` / `42-ingress` | Stable in-cluster address; external routing via Traefik. |
+| `50-hpa` | Horizontal autoscaling on CPU — which is *why* the rate-limit counters had to move to Redis. |
+| `51-pdb` | PodDisruptionBudget: keeps a minimum available during voluntary disruption (node drain, upgrade). |
+
+The three ideas worth taking away, all of which the manifests exist to make
+concrete:
+
+1. **Liveness and readiness are not the same question.** Liveness asks "is this
+   process wedged, should I restart it"; readiness asks "should I send traffic
+   right now". A liveness probe that checks the database turns a brief database
+   blip into a rolling restart of every healthy replica — the probe causes the
+   outage it was meant to report. Only readiness checks dependencies.
+2. **Horizontal scaling reveals bugs rather than creating them.** With
+   `memory://` counters and 3 replicas, `RATE_LIMIT="100/minute"` silently
+   becomes up to 300/minute, and which counter a request hits depends on which
+   replica the load balancer picked. Nothing errors; the limit is just a lie. The
+   HPA is what forces that to be confronted.
+3. **Migrations belong in a Job, not in application startup.** Running them on
+   boot means every replica races to alter the same schema, and a failed
+   migration leaves pods crash-looping instead of failing one visible Job.
+
+⚠️ **Honest status: these manifests are written and reviewed but not yet verified
+by an actual `kubectl apply`.** They target a local single-node cluster (k3s via
+Rancher Desktop, whose specific quirks `k8s/README.md` documents). I'd rather say
+that than imply a green rollout I can't show you. The things most likely to need
+adjusting on a different cluster are the StorageClass name, the Ingress class, and
+LoadBalancer behaviour.
+
+---
+
 ## Switching to PostgreSQL (without Docker)
 
 1. Start a Postgres and create a database.
@@ -223,7 +273,7 @@ pytest                          # run all tests
 pytest --cov=src --cov-report=term-missing   # with coverage
 ```
 
-**29 tests, ~80% coverage.** The suite covers happy paths and error paths for
+**34 tests, 79% coverage** (both re-measured, not estimated). The suite covers happy paths and error paths for
 auth, projects, tasks (incl. filtering and full cursor-pagination walk), and
 comments, plus a cross-user **authorization** test proving one user can't touch
 another's data.
@@ -295,13 +345,13 @@ Knowing what you skipped — and why — is a senior signal.
   expose `/metrics` (latency histograms, error rates).
 - **Load testing.** I'd validate p99 latency under target RPS with **k6** or
   Locust before claiming performance numbers.
-- **Kubernetes deploy.** The Dockerfile is prod-shaped (multi-stage, non-root,
-  healthcheck); I'd add a Deployment/Service/Ingress + liveness/readiness probes
-  + an HPA for autoscaling.
 - **Refresh tokens / token revocation.** Access tokens are short-lived; a real
   system adds refresh tokens and a revocation list (or short TTLs + rotation).
-- **Rate limiting backend.** slowapi is in-memory (per process); across multiple
-  instances I'd back it with Redis so limits are global.
+- **Automated quality gates.** There is no linter, type checker or CI pipeline
+  here — no `ruff`, no `mypy --strict`, no GitHub Actions workflow. The tests pass
+  because I choose to run them, which is not the same as being enforced: nothing
+  currently stops a commit that breaks them. This is the least defensible gap on
+  the list, because unlike everything above it costs almost nothing to close.
 
 ---
 
